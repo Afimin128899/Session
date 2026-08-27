@@ -7,7 +7,7 @@ from telethon.errors import PhoneNumberInvalidError, PhoneNumberOccupiedError
 # Конфиги
 API_ID = "34910343"  # Получи на https://my.telegram.org/apps
 API_HASH = "d20860d195501ba0993b794f952b1ef1"
-BOT_TOKEN = "YOUR_BOT_TOKEN"  # Получи у @BotFather
+BOT_TOKEN = "8842192137:AAEjfWCKek-riiQ_jzyQFqS9EW13Tj8CcRs"  # Получи у @BotFather
 
 # Директория для сессий
 SESSIONS_DIR = "sessions"
