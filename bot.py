@@ -7,6 +7,7 @@ from telethon.errors import PhoneNumberInvalidError, PhoneNumberOccupiedError
 # Конфиги
 API_ID = "34910343"  # Получи на https://my.telegram.org/apps
 API_HASH = "d20860d195501ba0993b794f952b1ef1"
+BOT_TOKEN = "YOUR_BOT_TOKEN"  # Получи у @BotFather
 
 # Директория для сессий
 SESSIONS_DIR = "sessions"
@@ -205,7 +206,7 @@ async def enter_password_handler(event):
     try:
         args = event.text.split(maxsplit=1)
         if len(args) < 2:
-            await event.reply("Исп��льзование: `/enter_password ваш_пароль`")
+            await event.reply("Использование: `/enter_password ваш_пароль`")
             return
         
         password = args[1].strip()
@@ -352,7 +353,7 @@ async def main():
     """Запуск бота"""
     print("🤖 Запуск бота...")
     async with bot:
-        await 8842192137:AAEjfWCKek-riiQ_jzyQFqS9EW13Tj8CcRs  # Получи токен у @BotFather
+        await bot.start(bot_token=BOT_TOKEN)
         print("✅ Бот запущен!")
         await bot.run_until_disconnected()
 
