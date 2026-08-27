@@ -5,8 +5,8 @@ from telethon.errors import SessionPasswordNeededError
 from telethon.errors import PhoneNumberInvalidError, PhoneNumberOccupiedError
 
 # Конфиги
-API_ID = "YOUR_API_ID"  # Получи на https://my.telegram.org/apps
-API_HASH = "YOUR_API_HASH"
+API_ID = "34910343"  # Получи на https://my.telegram.org/apps
+API_HASH = "d20860d195501ba0993b794f952b1ef1"
 
 # Директория для сессий
 SESSIONS_DIR = "sessions"
@@ -352,7 +352,7 @@ async def main():
     """Запуск бота"""
     print("🤖 Запуск бота...")
     async with bot:
-        await bot.start(bot_token="YOUR_BOT_TOKEN")  # Получи токен у @BotFather
+        await 8842192137:AAEjfWCKek-riiQ_jzyQFqS9EW13Tj8CcRs  # Получи токен у @BotFather
         print("✅ Бот запущен!")
         await bot.run_until_disconnected()
 
