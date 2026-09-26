@@ -598,6 +598,23 @@ async def cmd_cleanup(message: Message):
     await message.answer(f"Очищено сессий: {count}")
 
 
+@router.message(F.text)
+async def recover_code_input(message: Message, state: FSMContext):
+    """Recover a code entry if the FSM state was cleared while the client is alive.
+
+    If the FSM state is unexpectedly cleared while an active Telethon request
+    remains, restore the expected state and let the normal handler perform all
+    validation and sign-in work instead of silently dropping the message.
+    """
+    chat_id = message.chat.id
+    sess = active_sessions.get(chat_id)
+    if not sess or not sess.client or not sess.phone_code_hash:
+        return
+
+    await state.set_state(SessionStates.waiting_code)
+    await process_code(message, state)
+
+
 # ====================== ЗАПУСК ======================
 
 async def main():
