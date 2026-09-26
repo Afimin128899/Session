@@ -107,6 +107,7 @@ class ActiveSession:
     temp_dir: Optional[Path] = None
     created_at: datetime = field(default_factory=datetime.now)
     attempts: int = 0
+    last_code_sent_at: Optional[datetime] = None
 
 
 # Глобальное хранилище активных сессий (chat_id → ActiveSession)
@@ -149,15 +150,32 @@ def password_keyboard() -> InlineKeyboardMarkup:
 
 
 def normalize_phone(text: str) -> Optional[str]:
+    """Return a phone number in E.164 form, accepting input with or without ``+``."""
     text = text.strip().replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
-    if not text.startswith("+"):
-        if text.startswith("8") and len(text) == 11:  # российский формат
-            text = "+7" + text[1:]
-        else:
-            return None
-    if not text[1:].isdigit() or not (10 <= len(text) <= 16):
+    if text.startswith("00"):
+        text = text[2:]
+    if text.startswith("+"):
+        digits = text[1:]
+    else:
+        digits = text
+
+    # A common local Russian spelling is 8XXXXXXXXXX; convert it to +7XXXXXXXXXX.
+    if digits.startswith("8") and len(digits) == 11:
+        digits = "7" + digits[1:]
+
+    # E.164 numbers contain at most 15 digits.  The lower bound prevents
+    # attempting an authentication request for obviously incomplete input.
+    if not digits.isdigit() or not (10 <= len(digits) <= 15):
         return None
-    return text
+    return f"+{digits}"
+
+
+def normalize_code(text: str) -> Optional[str]:
+    """Accept a Telegram confirmation code typed with spaces or hyphens."""
+    code = text.strip().replace(" ", "").replace("-", "")
+    if not code.isdigit() or not (4 <= len(code) <= 8):
+        return None
+    return code
 
 
 async def cleanup_user(chat_id: int, state: Optional[FSMContext] = None) -> None:
@@ -289,6 +307,8 @@ async def finalize_and_send(
         original = Path(str(temp_dir / "session") + ".session")
         if original.exists():
             original.rename(session_file)
+        if not session_file.exists():
+            raise FileNotFoundError("Файл Telegram-сессии не был создан")
 
         meta_file = temp_dir / f"{phone}.json"
         meta_file.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -323,7 +343,7 @@ async def finalize_and_send(
     except Exception as e:
         logger.exception(f"Ошибка финализации {chat_id}")
         stats["failed"] += 1
-        await message.answer(f"❌ Ошибка при создании файлов: <code>{e}</code>")
+        await message.answer("❌ Не удалось подготовить файлы сессии. Попробуйте начать заново: /start")
     finally:
         await cleanup_user(chat_id, state)
 
@@ -338,8 +358,6 @@ async def cmd_start(message: Message, state: FSMContext):
     chat_id = message.chat.id
     await cleanup_user(chat_id, state)  # на всякий случай
 
-    # Ограничение количества одновременных попыток
-    user_active = sum(1 for s in active_sessions.values() if s.created_at > datetime.now() - timedelta(hours=1))
     # Простая защита от массового создания
     if len(active_sessions) > 50:  # глобальный лимит
         await message.answer("⏳ Сервер сейчас перегружен. Попробуйте через несколько минут.")
@@ -352,8 +370,8 @@ async def cmd_start(message: Message, state: FSMContext):
     await message.answer(
         "👋 <b>Генератор Telegram-сессий</b>\n\n"
         "Я создам файл <code>.session</code> + метаданные в удобном ZIP-архиве.\n\n"
-        "📱 Пришлите номер телефона в международном формате:\n"
-        "<code>+79001234567</code>",
+        "📱 Пришлите номер телефона в международном формате. Знак <code>+</code> необязателен:\n"
+        "<code>79001234567</code> или <code>+79001234567</code>",
         reply_markup=phone_keyboard(),
     )
 
@@ -380,7 +398,7 @@ async def process_phone(message: Message, state: FSMContext):
 
     if not phone:
         await message.answer(
-            "❌ Неверный формат номера.\nПример: <code>+79001234567</code>",
+            "❌ Неверный формат номера.\nПример: <code>79001234567</code> или <code>+79001234567</code>",
             reply_markup=phone_keyboard(),
         )
         return
@@ -412,6 +430,7 @@ async def process_phone(message: Message, state: FSMContext):
 
         result = await client.send_code_request(phone)
         sess.phone_code_hash = result.phone_code_hash
+        sess.last_code_sent_at = datetime.now()
 
         await state.set_state(SessionStates.waiting_code)
         await status_msg.edit_text(
@@ -447,8 +466,14 @@ async def resend_code(callback: CallbackQuery, state: FSMContext):
         return
 
     try:
+        if sess.last_code_sent_at and datetime.now() - sess.last_code_sent_at < timedelta(seconds=60):
+            remaining = 60 - int((datetime.now() - sess.last_code_sent_at).total_seconds())
+            await callback.answer(f"Повторный запрос будет доступен через {remaining} сек.", show_alert=True)
+            return
+
         result = await sess.client.send_code_request(sess.phone)
         sess.phone_code_hash = result.phone_code_hash
+        sess.last_code_sent_at = datetime.now()
         await callback.message.edit_text(
             f"📩 Новый код отправлен на <code>{sess.phone}</code>\n\nВведите код:",
             reply_markup=code_keyboard(),
@@ -463,11 +488,18 @@ async def resend_code(callback: CallbackQuery, state: FSMContext):
 @router.message(SessionStates.waiting_code)
 async def process_code(message: Message, state: FSMContext):
     chat_id = message.chat.id
-    code = (message.text or "").strip().replace(" ", "")
+    code = normalize_code(message.text or "")
 
     sess = active_sessions.get(chat_id)
     if not sess or not sess.client:
         await message.answer("Сессия потеряна. /start")
+        return
+
+    if not code:
+        await message.answer(
+            "❌ Код должен содержать от 4 до 8 цифр. Попробуйте ещё раз:",
+            reply_markup=code_keyboard(),
+        )
         return
 
     sess.attempts += 1
@@ -518,6 +550,10 @@ async def process_password(message: Message, state: FSMContext):
     sess = active_sessions.get(chat_id)
     if not sess or not sess.client:
         await message.answer("Сессия потеряна. /start")
+        return
+
+    if not password:
+        await message.answer("❌ Пароль не может быть пустым. Попробуйте ещё раз:", reply_markup=password_keyboard())
         return
 
     try:
