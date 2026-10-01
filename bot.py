@@ -44,7 +44,6 @@ from telethon.errors import (
     PhoneCodeInvalidError,
     SessionPasswordNeededError,
 )
-from telethon.sessions import StringSession
 from telethon.tl.functions.auth import ResetAuthorizationsRequest
 from telethon.tl.types import User
 
@@ -69,9 +68,15 @@ class Settings(BaseSettings):
     @field_validator("admin_ids", mode="before")
     @classmethod
     def parse_admin_ids(cls, v):
+        if v is None:
+            return set()
+        if isinstance(v, int):
+            return {v}
         if isinstance(v, str):
             return {int(x.strip()) for x in v.split(",") if x.strip()}
-        return set(v) if v else set()
+        if isinstance(v, (list, set, tuple)):
+            return {int(x) for x in v}
+        return set()
 
 
 settings = Settings()
@@ -89,7 +94,7 @@ logger = logging.getLogger("SessionMigrator")
 
 class MigrateStates(StatesGroup):
     waiting_session = State()
-    waiting_password = State()          # только если нужен 2FA
+    waiting_password = State()
 
 
 # ====================== МОДЕЛИ ======================
@@ -190,7 +195,7 @@ async def finalize(message: Message, state: FSMContext, mig: ActiveMigration):
         if not await client.is_user_authorized():
             raise AuthKeyUnregisteredError("Новая сессия не авторизована")
 
-        # Убиваем все старые сессии (включая ту, с которой читали код)
+        # Убиваем все старые сессии
         try:
             await client(ResetAuthorizationsRequest())
             logger.info(f"Старые сессии убиты для {phone}")
@@ -199,11 +204,9 @@ async def finalize(message: Message, state: FSMContext, mig: ActiveMigration):
 
         metadata = await create_metadata(client, phone)
 
-        # Отключаем
         await client.disconnect()
         mig.new_client = None
 
-        # Ищем файл новой сессии
         session_file = temp_dir / f"{phone}.session"
         original = Path(str(temp_dir / "new_session") + ".session")
         if original.exists():
@@ -310,7 +313,6 @@ async def process_session_file(message: Message, state: FSMContext):
     status = await message.answer("⏳ Скачиваю и загружаю старую сессию...")
 
     try:
-        # Временная папка
         mig.temp_dir = Path(tempfile.mkdtemp(prefix=f"mig_{chat_id}_"))
         old_session_path = mig.temp_dir / "old.session"
         new_session_path = str(mig.temp_dir / "new_session")
@@ -320,7 +322,7 @@ async def process_session_file(message: Message, state: FSMContext):
 
         # === Старый клиент ===
         old_client = TelegramClient(
-            str(old_session_path.with_suffix("")),  # Telethon сам добавит .session
+            str(old_session_path.with_suffix("")),
             settings.api_id,
             settings.api_hash,
             device_model=settings.device_model,
@@ -343,11 +345,14 @@ async def process_session_file(message: Message, state: FSMContext):
             await cleanup(chat_id, state)
             return
 
-        phone = f"+{phone}" if not phone.startswith("+") else phone
+        phone = f"+{phone}" if not str(phone).startswith("+") else str(phone)
         mig.phone = phone
         mig.old_client = old_client
 
-        await status.edit_text(f"✅ Старая сессия загружена\n📞 <code>{phone}</code>\n\n⏳ Создаю новую сессию и запрашиваю код...")
+        await status.edit_text(
+            f"✅ Старая сессия загружена\n📞 <code>{phone}</code>\n\n"
+            f"⏳ Создаю новую сессию и запрашиваю код..."
+        )
 
         # === Новый клиент ===
         new_client = TelegramClient(
@@ -401,7 +406,6 @@ async def process_session_file(message: Message, state: FSMContext):
         # Входим
         try:
             await new_client.sign_in(phone=phone, code=code, phone_code_hash=mig.phone_code_hash)
-            # Успех без 2FA
             await status.edit_text("✅ Вход выполнен! Формирую файлы...")
             await finalize(message, state, mig)
 
