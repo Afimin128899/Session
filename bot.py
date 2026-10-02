@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Telegram Session Migrator Bot
-Обработка сессий ПО ОЧЕРЕДИ (можно кидать несколько файлов)
++ Очистка профиля (имя, ава, био, выход из всех чатов)
++ Режим авто / ручной ввод кода
 """
 
 from __future__ import annotations
@@ -41,9 +42,15 @@ from telethon.errors import (
     AuthKeyUnregisteredError,
     PasswordHashInvalidError,
     SessionPasswordNeededError,
+    FloodWaitError,
 )
+from telethon.tl.functions.account import UpdateProfileRequest, GetAuthorizationsRequest
 from telethon.tl.functions.auth import ResetAuthorizationsRequest
-from telethon.tl.types import User
+from telethon.tl.functions.photos import DeletePhotosRequest, GetUserPhotosRequest
+from telethon.tl.functions.messages import DeleteHistoryRequest
+from telethon.tl.types import User, InputPhoto, Channel, Chat
+from telethon.tl.functions.channels import LeaveChannelRequest
+from telethon.tl.functions.messages import DeleteChatUserRequest
 
 # ====================== КОНФИГ ======================
 
@@ -56,7 +63,10 @@ class Settings(BaseSettings):
 
     admin_ids: Set[int] = Field(default_factory=set)
     session_timeout_minutes: int = 15
-    max_queue_per_user: int = 10          # максимум файлов в очереди у одного юзера
+    max_queue_per_user: int = 10
+
+    # По умолчанию авто-получение кода
+    default_auto_code: bool = True
 
     device_model: str = "SLANFB5Z-EXTREME"
     system_version: str = "Windows 10"
@@ -93,6 +103,7 @@ logger = logging.getLogger("SessionMigrator")
 
 class MigrateStates(StatesGroup):
     waiting_password = State()
+    waiting_manual_code = State()
 
 
 # ====================== МОДЕЛИ ======================
@@ -103,7 +114,6 @@ class QueueItem:
     chat_id: int
     file_path: Path
     original_name: str
-    status_message: Optional[Message] = None
     created_at: datetime = field(default_factory=datetime.now)
 
 
@@ -121,16 +131,15 @@ class ActiveMigration:
     received_code: Optional[str] = None
     status_message: Optional[Message] = None
     waiting_2fa: bool = False
+    waiting_manual_code: bool = False
     queue_item: Optional[QueueItem] = None
 
 
-# Очередь: chat_id → список файлов
+# Режим авто/ручной для каждого пользователя
+user_auto_mode: Dict[int, bool] = {}
+
 user_queues: Dict[int, List[QueueItem]] = {}
-
-# Текущая активная миграция (только одна на пользователя)
 current_migration: Dict[int, ActiveMigration] = {}
-
-# Флаг, что воркер очереди уже запущен для пользователя
 queue_workers: Dict[int, bool] = {}
 
 stats = {"started": 0, "success": 0, "failed": 0, "cancelled": 0}
@@ -142,6 +151,10 @@ def is_admin(user_id: int) -> bool:
     return user_id in settings.admin_ids
 
 
+def get_auto_mode(chat_id: int) -> bool:
+    return user_auto_mode.get(chat_id, settings.default_auto_code)
+
+
 def cancel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❌ Отменить очередь", callback_data="cancel_queue")]
@@ -150,7 +163,6 @@ def cancel_kb() -> InlineKeyboardMarkup:
 
 async def cleanup_migration(mig: ActiveMigration, state: Optional[FSMContext] = None):
     chat_id = mig.chat_id
-
     if chat_id in current_migration and current_migration[chat_id].id == mig.id:
         del current_migration[chat_id]
 
@@ -165,16 +177,14 @@ async def cleanup_migration(mig: ActiveMigration, state: Optional[FSMContext] = 
     if mig.temp_dir and mig.temp_dir.exists():
         shutil.rmtree(mig.temp_dir, ignore_errors=True)
 
-    if state and mig.waiting_2fa:
+    if state and (mig.waiting_2fa or mig.waiting_manual_code):
         await state.clear()
 
 
 async def clear_user_queue(chat_id: int, state: Optional[FSMContext] = None):
-    # Останавливаем текущую
     if chat_id in current_migration:
         await cleanup_migration(current_migration[chat_id], state)
 
-    # Чистим очередь
     if chat_id in user_queues:
         for item in user_queues[chat_id]:
             try:
@@ -187,6 +197,83 @@ async def clear_user_queue(chat_id: int, state: Optional[FSMContext] = None):
     queue_workers[chat_id] = False
     if state:
         await state.clear()
+
+
+# ====================== ОЧИСТКА АККАУНТА ======================
+
+async def clean_account(client: TelegramClient, status: Message):
+    """Убирает имя, аву, био и выходит из всех чатов/каналов."""
+    try:
+        await status.edit_text("🧹 Очищаю профиль (имя, ава, описание)...")
+
+        # 1. Убираем имя и био
+        try:
+            await client(UpdateProfileRequest(
+                first_name=".",
+                last_name="",
+                about=""
+            ))
+            logger.info("Профиль очищен (имя + био)")
+        except Exception as e:
+            logger.warning(f"Не удалось очистить профиль: {e}")
+
+        # 2. Удаляем все фото профиля
+        try:
+            photos = await client(GetUserPhotosRequest(
+                user_id="me",
+                offset=0,
+                max_id=0,
+                limit=100
+            ))
+            if photos.photos:
+                input_photos = [
+                    InputPhoto(
+                        id=p.id,
+                        access_hash=p.access_hash,
+                        file_reference=p.file_reference
+                    ) for p in photos.photos
+                ]
+                await client(DeletePhotosRequest(id=input_photos))
+                logger.info(f"Удалено фото: {len(input_photos)}")
+        except Exception as e:
+            logger.warning(f"Не удалось удалить фото: {e}")
+
+        await status.edit_text("🧹 Выхожу из всех групп и каналов...")
+
+        # 3. Выходим из всех групп и каналов
+        left = 0
+        async for dialog in client.iter_dialogs():
+            entity = dialog.entity
+            try:
+                if isinstance(entity, Channel):
+                    # Канал или супергруппа
+                    await client(LeaveChannelRequest(entity))
+                    left += 1
+                elif isinstance(entity, Chat):
+                    # Обычная группа
+                    await client(DeleteChatUserRequest(
+                        chat_id=entity.id,
+                        user_id="me"
+                    ))
+                    left += 1
+
+                # Антифлуд
+                if left % 15 == 0:
+                    await asyncio.sleep(1.5)
+                else:
+                    await asyncio.sleep(0.35)
+
+            except FloodWaitError as e:
+                await asyncio.sleep(e.seconds + 1)
+            except Exception:
+                continue
+
+        logger.info(f"Вышел из {left} чатов/каналов")
+        await status.edit_text(f"✅ Очистка завершена (вышел из {left} чатов)")
+
+    except Exception as e:
+        logger.exception("Ошибка очистки аккаунта")
+        await status.edit_text(f"⚠️ Очистка прошла с ошибками: {e}")
 
 
 # ====================== TELETHON ======================
@@ -222,12 +309,16 @@ async def finalize(mig: ActiveMigration, message: Message, state: Optional[FSMCo
     client = mig.new_client
     phone = mig.phone
     temp_dir = mig.temp_dir
+    status = mig.status_message or message
 
     try:
         if not client or not await client.is_user_authorized():
             raise AuthKeyUnregisteredError("Новая сессия не авторизована")
 
-        # 1. Выходим из старой
+        # ===== ОЧИСТКА АККАУНТА =====
+        await clean_account(client, status)
+
+        # 1. Выходим из старой сессии
         if mig.old_client:
             try:
                 if mig.old_client.is_connected():
@@ -269,12 +360,12 @@ async def finalize(mig: ActiveMigration, message: Message, state: Optional[FSMCo
         data = zip_path.read_bytes()
 
         caption = (
-            f"✅ <b>Новая сессия создана!</b>\n\n"
+            f"✅ <b>Новая сессия создана + очищена!</b>\n\n"
             f"📞 <code>{phone}</code>\n"
             f"🆔 <code>{metadata['id']}</code>\n"
-            f"👤 {metadata['first_name']} {metadata['last_name']}\n"
-            f"{'⭐ Premium' if metadata['is_premium'] else ''}\n\n"
-            f"🔒 Старая сессия завершена."
+            f"👤 Имя/ава/био удалены\n"
+            f"🚪 Вышел из всех чатов\n"
+            f"🔒 Старая сессия завершена"
         )
 
         await message.answer_document(
@@ -298,10 +389,12 @@ async def finalize(mig: ActiveMigration, message: Message, state: Optional[FSMCo
 async def process_one_session(item: QueueItem, bot: Bot, state: FSMContext):
     chat_id = item.chat_id
     mig_id = str(uuid.uuid4())[:8]
+    auto_mode = get_auto_mode(chat_id)
 
     status = await bot.send_message(
         chat_id,
-        f"⏳ Начинаю обработку <b>{item.original_name}</b>..."
+        f"⏳ Начинаю: <b>{item.original_name}</b>\n"
+        f"Режим кода: <b>{'авто' if auto_mode else 'ручной'}</b>"
     )
 
     mig = ActiveMigration(
@@ -317,10 +410,9 @@ async def process_one_session(item: QueueItem, bot: Bot, state: FSMContext):
         old_session_path = mig.temp_dir / "old.session"
         new_session_path = str(mig.temp_dir / "new_session")
 
-        # Копируем файл из очереди
         shutil.copy(item.file_path, old_session_path)
 
-        # === Старый клиент ===
+        # Старый клиент
         old_client = TelegramClient(
             str(old_session_path.with_suffix("")),
             settings.api_id,
@@ -341,7 +433,7 @@ async def process_one_session(item: QueueItem, bot: Bot, state: FSMContext):
         me = await old_client.get_me()
         phone = me.phone
         if not phone:
-            await status.edit_text(f"❌ <b>{item.original_name}</b> — не удалось получить номер.")
+            await status.edit_text(f"❌ <b>{item.original_name}</b> — нет номера.")
             await cleanup_migration(mig)
             return
 
@@ -350,12 +442,10 @@ async def process_one_session(item: QueueItem, bot: Bot, state: FSMContext):
         mig.old_client = old_client
 
         await status.edit_text(
-            f"✅ <b>{item.original_name}</b>\n"
-            f"📞 <code>{phone}</code>\n\n"
-            f"⏳ Запрашиваю код..."
+            f"✅ <b>{item.original_name}</b>\n📞 <code>{phone}</code>\n\n⏳ Запрашиваю код..."
         )
 
-        # === Новый клиент ===
+        # Новый клиент
         new_client = TelegramClient(
             new_session_path,
             settings.api_id,
@@ -372,52 +462,61 @@ async def process_one_session(item: QueueItem, bot: Bot, state: FSMContext):
         result = await new_client.send_code_request(phone)
         mig.phone_code_hash = result.phone_code_hash
 
-        mig.code_event = asyncio.Event()
-        mig.received_code = None
+        # ===== РЕЖИМ КОДА =====
+        if auto_mode:
+            # Автоматический
+            mig.code_event = asyncio.Event()
+            mig.received_code = None
 
-        @old_client.on(events.NewMessage(from_users=777000))
-        async def code_handler(event):
-            if mig.code_event and not mig.code_event.is_set():
-                match = re.search(r"\b(\d{5,6})\b", event.raw_text)
-                if match:
-                    mig.received_code = match.group(1)
-                    logger.info(f"[{mig.id}] Код получен: {mig.received_code}")
-                    mig.code_event.set()
+            @old_client.on(events.NewMessage(from_users=777000))
+            async def code_handler(event):
+                if mig.code_event and not mig.code_event.is_set():
+                    match = re.search(r"\b(\d{5,6})\b", event.raw_text)
+                    if match:
+                        mig.received_code = match.group(1)
+                        logger.info(f"[{mig.id}] Код получен: {mig.received_code}")
+                        mig.code_event.set()
 
-        await status.edit_text(
-            f"📩 <b>{item.original_name}</b>\n"
-            f"Код запрошен. Жду сообщение от 777000..."
-        )
+            await status.edit_text("📩 Код запрошен. Жду от 777000...")
 
-        try:
-            await asyncio.wait_for(mig.code_event.wait(), timeout=90)
-        except asyncio.TimeoutError:
-            await status.edit_text(f"❌ <b>{item.original_name}</b> — код не пришёл.")
-            await cleanup_migration(mig)
-            return
+            try:
+                await asyncio.wait_for(mig.code_event.wait(), timeout=90)
+            except asyncio.TimeoutError:
+                await status.edit_text(f"❌ Код не пришёл. Попробуй /manual и введи сам.")
+                await cleanup_migration(mig)
+                return
 
-        code = mig.received_code
+            code = mig.received_code
+        else:
+            # Ручной режим
+            mig.waiting_manual_code = True
+            await state.set_state(MigrateStates.waiting_manual_code)
+            await status.edit_text(
+                f"📩 Код отправлен на <code>{phone}</code>\n\n"
+                f"Введи код вручную:",
+                reply_markup=cancel_kb(),
+            )
+            return  # Ждём ввода в хендлере
+
         if not code:
-            await status.edit_text(f"❌ <b>{item.original_name}</b> — не удалось извлечь код.")
+            await status.edit_text("❌ Не удалось получить код.")
             await cleanup_migration(mig)
             return
 
-        await status.edit_text(f"✅ Код получен: <code>{code}</code>\n⏳ Вхожу...")
+        await status.edit_text(f"✅ Код: <code>{code}</code>\n⏳ Вхожу...")
 
         try:
             await new_client.sign_in(phone=phone, code=code, phone_code_hash=mig.phone_code_hash)
-            await status.edit_text("✅ Вход выполнен! Формирую файлы...")
+            await status.edit_text("✅ Вход выполнен! Очищаю аккаунт...")
             await finalize(mig, status, state)
 
         except SessionPasswordNeededError:
             mig.waiting_2fa = True
             await state.set_state(MigrateStates.waiting_password)
             await status.edit_text(
-                f"🔒 <b>{item.original_name}</b>\n"
-                f"Нужен облачный пароль (2FA).\n\nОтправь пароль:",
+                f"🔒 Нужен облачный пароль (2FA).\nОтправь пароль:",
                 reply_markup=cancel_kb(),
             )
-            # Ждём, пока пользователь введёт пароль (обработается в хендлере)
             return
 
         except Exception as e:
@@ -426,7 +525,7 @@ async def process_one_session(item: QueueItem, bot: Bot, state: FSMContext):
             await cleanup_migration(mig)
 
     except Exception as e:
-        logger.exception(f"[{mig.id}] Ошибка обработки")
+        logger.exception(f"[{mig.id}] Ошибка")
         await status.edit_text(f"❌ Ошибка: <code>{e}</code>")
         await cleanup_migration(mig)
 
@@ -434,7 +533,6 @@ async def process_one_session(item: QueueItem, bot: Bot, state: FSMContext):
 # ====================== ВОРКЕР ОЧЕРЕДИ ======================
 
 async def queue_worker(chat_id: int, bot: Bot, state: FSMContext):
-    """Обрабатывает очередь пользователя по одному файлу."""
     queue_workers[chat_id] = True
 
     while True:
@@ -442,27 +540,22 @@ async def queue_worker(chat_id: int, bot: Bot, state: FSMContext):
         if not queue:
             break
 
-        # Берём первый файл
         item = queue.pop(0)
         if not queue:
             user_queues.pop(chat_id, None)
 
         remaining = len(user_queues.get(chat_id, []))
         if remaining > 0:
-            await bot.send_message(
-                chat_id,
-                f"📋 В очереди ещё: <b>{remaining}</b> файл(ов)"
-            )
+            await bot.send_message(chat_id, f"📋 В очереди ещё: <b>{remaining}</b>")
 
         await process_one_session(item, bot, state)
 
-        # Если ушли в ожидание 2FA — выходим из воркера,
-        # продолжение будет после ввода пароля
-        if chat_id in current_migration and current_migration[chat_id].waiting_2fa:
+        # Если ушли в ожидание кода/2FA — воркер останавливается
+        mig = current_migration.get(chat_id)
+        if mig and (mig.waiting_2fa or mig.waiting_manual_code):
             queue_workers[chat_id] = False
             return
 
-        # Небольшая пауза между сессиями
         await asyncio.sleep(1.5)
 
     queue_workers[chat_id] = False
@@ -479,13 +572,31 @@ async def cmd_start(message: Message, state: FSMContext):
     chat_id = message.chat.id
     await clear_user_queue(chat_id, state)
 
+    mode = "авто" if get_auto_mode(chat_id) else "ручной"
     await message.answer(
-        "🔄 <b>Мигратор сессий (очередь)</b>\n\n"
-        "Отправляй мне <b>.session</b> файлы — можно сразу несколько.\n"
-        "Я буду обрабатывать их <b>по очереди</b>.\n\n"
-        "После каждой успешной миграции старая сессия завершается.",
+        "🔄 <b>Мигратор сессий</b>\n\n"
+        "Отправляй <b>.session</b> файлы (можно несколько — по очереди).\n\n"
+        f"Текущий режим кода: <b>{mode}</b>\n"
+        "• /auto — ловить код автоматически\n"
+        "• /manual — вводить код вручную\n\n"
+        "После входа бот:\n"
+        "• Убирает имя, аву и описание\n"
+        "• Выходит из всех чатов и каналов\n"
+        "• Завершает старую сессию",
         reply_markup=cancel_kb(),
     )
+
+
+@router.message(Command("auto"))
+async def cmd_auto(message: Message):
+    user_auto_mode[message.chat.id] = True
+    await message.answer("✅ Режим: <b>автоматический</b> (код ловится сам)")
+
+
+@router.message(Command("manual"))
+async def cmd_manual(message: Message):
+    user_auto_mode[message.chat.id] = False
+    await message.answer("✅ Режим: <b>ручной</b> (будешь вводить код сам)")
 
 
 @router.message(Command("cancel"))
@@ -496,121 +607,4 @@ async def cmd_cancel(event: Message | CallbackQuery, state: FSMContext):
     stats["cancelled"] += 1
 
     text = "✅ Очередь и текущая обработка отменены."
-    if isinstance(event, CallbackQuery):
-        await event.message.edit_text(text)
-        await event.answer()
-    else:
-        await event.answer(text)
-
-
-@router.message(F.document)
-async def process_session_file(message: Message, state: FSMContext):
-    chat_id = message.chat.id
-    doc: Document = message.document
-
-    if not doc.file_name or not doc.file_name.lower().endswith(".session"):
-        await message.answer("❌ Нужен файл с расширением <code>.session</code>")
-        return
-
-    # Проверяем лимит очереди
-    current_queue_len = len(user_queues.get(chat_id, []))
-    if current_queue_len >= settings.max_queue_per_user:
-        await message.answer(f"❌ Очередь полная (максимум {settings.max_queue_per_user}).")
-        return
-
-    # Скачиваем файл во временную папку
-    temp_dir = Path(tempfile.mkdtemp(prefix=f"queue_{chat_id}_"))
-    file_path = temp_dir / doc.file_name
-    await message.bot.download(doc, destination=file_path)
-
-    item = QueueItem(
-        id=str(uuid.uuid4())[:8],
-        chat_id=chat_id,
-        file_path=file_path,
-        original_name=doc.file_name,
-    )
-
-    if chat_id not in user_queues:
-        user_queues[chat_id] = []
-    user_queues[chat_id].append(item)
-
-    pos = len(user_queues[chat_id])
-    await message.answer(
-        f"📥 <b>{doc.file_name}</b> добавлен в очередь.\n"
-        f"Позиция: <b>{pos}</b>",
-        reply_markup=cancel_kb(),
-    )
-
-    stats["started"] += 1
-
-    # Запускаем воркер, если он ещё не работает
-    if not queue_workers.get(chat_id, False):
-        asyncio.create_task(queue_worker(chat_id, message.bot, state))
-
-
-@router.message(MigrateStates.waiting_password)
-async def process_2fa(message: Message, state: FSMContext):
-    chat_id = message.chat.id
-    password = (message.text or "").strip()
-
-    mig = current_migration.get(chat_id)
-    if not mig or not mig.new_client or not mig.waiting_2fa:
-        await message.answer("Сейчас нет ожидания пароля. /start")
-        return
-
-    if not password:
-        await message.answer("❌ Пароль пустой. Попробуй ещё раз:")
-        return
-
-    status = await message.answer("⏳ Проверяю пароль...")
-
-    try:
-        await mig.new_client.sign_in(password=password)
-        mig.waiting_2fa = False
-        await status.edit_text("✅ 2FA пройден! Формирую файлы...")
-        await finalize(mig, status, state)
-
-        # После 2FA продолжаем очередь
-        if user_queues.get(chat_id):
-            asyncio.create_task(queue_worker(chat_id, message.bot, state))
-
-    except PasswordHashInvalidError:
-        await status.edit_text("❌ Неверный пароль. Попробуй ещё раз:")
-    except Exception as e:
-        logger.exception("Ошибка 2FA")
-        await status.edit_text(f"❌ Ошибка: <code>{e}</code>")
-        await cleanup_migration(mig, state)
-
-
-@router.message(Command("stats"))
-async def cmd_stats(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-
-    total_queue = sum(len(q) for q in user_queues.values())
-    total_active = len(current_migration)
-
-    await message.answer(
-        f"📊 <b>Статистика</b>\n\n"
-        f"Запусков: {stats['started']}\n"
-        f"Успешных: {stats['success']}\n"
-        f"Ошибок: {stats['failed']}\n"
-        f"Отменено: {stats['cancelled']}\n"
-        f"Сейчас в очереди: {total_queue}\n"
-        f"Сейчас обрабатывается: {total_active}"
-    )
-
-
-# ====================== ЗАПУСК ======================
-
-async def main():
-    bot = Bot(token=settings.bot_token, default=DefaultBotProperties(parse_mode="HTML"))
-    dp = Dispatcher(storage=MemoryStorage())
-    dp.include_router(router)
-
-    logger.info("Session Migrator Bot (очередь) запущен")
-    await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    if isinstanc
