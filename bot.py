@@ -621,4 +621,115 @@ async def process_session_file(message: Message, state: FSMContext):
         reply_markup=cancel_kb(),
     )
 
-   
+
+    if not queue_workers.get(chat_id) and chat_id not in current_migration:
+        asyncio.create_task(queue_worker(chat_id, message.bot, state))
+
+
+def resume_queue(chat_id: int, bot: Bot, state: FSMContext):
+    if user_queues.get(chat_id) and not queue_workers.get(chat_id) and chat_id not in current_migration:
+        asyncio.create_task(queue_worker(chat_id, bot, state))
+
+
+@router.message(MigrateStates.waiting_password, F.text)
+async def handle_password(message: Message, state: FSMContext):
+    chat_id = message.chat.id
+    mig = current_migration.get(chat_id)
+
+    if not mig or not mig.waiting_2fa or not mig.new_client:
+        await state.clear()
+        await message.answer("❌ Нет активной миграции, ожидающей пароль.")
+        return
+
+    password = message.text.strip()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    try:
+        await mig.new_client.sign_in(password=password)
+    except PasswordHashInvalidError:
+        await message.answer("❌ Неверный пароль. Попробуй ещё раз:", reply_markup=cancel_kb())
+        return
+    except FloodWaitError as e:
+        await message.answer(f"⏳ Слишком много попыток. Подожди {e.seconds} сек.")
+        return
+    except Exception as e:
+        logger.exception("Ошибка входа с 2FA")
+        stats["failed"] += 1
+        await message.answer(f"❌ Ошибка входа: <code>{e}</code>")
+        await cleanup_migration(mig, state)
+        await state.clear()
+        resume_queue(chat_id, message.bot, state)
+        return
+
+    mig.waiting_2fa = False
+    await state.clear()
+    await message.answer("✅ Вход выполнен! Очищаю аккаунт...")
+    await finalize(mig, message, state)
+    resume_queue(chat_id, message.bot, state)
+
+
+@router.message(MigrateStates.waiting_manual_code, F.text)
+async def handle_manual_code(message: Message, state: FSMContext):
+    chat_id = message.chat.id
+    mig = current_migration.get(chat_id)
+
+    if not mig or not mig.waiting_manual_code or not mig.new_client:
+        await state.clear()
+        await message.answer("❌ Нет активной миграции, ожидающей код.")
+        return
+
+    code = re.sub(r"\D", "", message.text)
+    if not code:
+        await message.answer("❌ Код должен содержать цифры. Попробуй ещё раз:", reply_markup=cancel_kb())
+        return
+
+    try:
+        await mig.new_client.sign_in(phone=mig.phone, code=code, phone_code_hash=mig.phone_code_hash)
+    except SessionPasswordNeededError:
+        mig.waiting_manual_code = False
+        mig.waiting_2fa = True
+        await state.set_state(MigrateStates.waiting_password)
+        await message.answer("🔒 Нужен облачный пароль (2FA). Отправь пароль:", reply_markup=cancel_kb())
+        return
+    except Exception as e:
+        logger.exception("Ошибка входа по ручному коду")
+        stats["failed"] += 1
+        await message.answer(f"❌ Ошибка входа: <code>{e}</code>")
+        await cleanup_migration(mig, state)
+        await state.clear()
+        resume_queue(chat_id, message.bot, state)
+        return
+
+    mig.waiting_manual_code = False
+    await state.clear()
+    await message.answer("✅ Вход выполнен! Очищаю аккаунт...")
+    await finalize(mig, message, state)
+    resume_queue(chat_id, message.bot, state)
+
+
+# ====================== ЗАПУСК ======================
+
+async def main():
+    bot = Bot(
+        token=settings.bot_token,
+        default=DefaultBotProperties(parse_mode="HTML"),
+    )
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(router)
+
+    logger.info("Бот запущен")
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    finally:
+        await bot.session.close()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Бот остановлен")
