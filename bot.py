@@ -58,7 +58,6 @@ from telethon.tl.functions.messages import DeleteChatUserRequest
 from telethon.tl.functions.photos import DeletePhotosRequest, GetUserPhotosRequest
 from telethon.tl.types import Channel, Chat, InputPhoto, User
 
-# ====================== КОНФИГ ======================
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
@@ -68,8 +67,6 @@ class Settings(BaseSettings):
     bot_token: str
 
     admin_ids: Set[int] = Field(default_factory=set)
-    session_timeout_minutes: int = 15
-    max_queue_per_user: int = 8
     default_auto_code: bool = True
 
     device_model: str = "SLANFB5Z-EXTREME"
@@ -94,8 +91,6 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
-# ====================== ЛОГИРОВАНИЕ ======================
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
@@ -103,7 +98,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("SessionBot")
 
-# ====================== FSM ======================
 
 class States(StatesGroup):
     waiting_token = State()
@@ -114,17 +108,18 @@ class States(StatesGroup):
     waiting_session = State()
 
 
-# ====================== ХРАНИЛИЩЕ ======================
-
 TOKENS: Dict[str, dict] = {}
 AUTHORIZED: Set[int] = set()
 user_auto_mode: Dict[int, bool] = {}
 
+
 def is_admin(user_id: int) -> bool:
     return user_id in settings.admin_ids
 
+
 def get_auto_mode(chat_id: int) -> bool:
     return user_auto_mode.get(chat_id, settings.default_auto_code)
+
 
 def generate_token(length: int = 10) -> str:
     return secrets.token_urlsafe(length)[:length].upper()
@@ -148,8 +143,6 @@ class ActiveSession:
 active_sessions: Dict[int, ActiveSession] = {}
 stats = {"started": 0, "success": 0, "failed": 0, "cancelled": 0, "tokens_used": 0}
 
-
-# ====================== КЛАВИАТУРЫ ======================
 
 def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -178,8 +171,6 @@ def admin_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
     ])
 
-
-# ====================== УТИЛИТЫ ======================
 
 def normalize_phone(text: str) -> Optional[str]:
     text = text.strip().replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
@@ -219,12 +210,9 @@ async def cleanup_user(chat_id: int, state: Optional[FSMContext] = None):
         await state.clear()
 
 
-# ====================== ОЧИСТКА АККАУНТА ======================
-
 async def clean_account(client: TelegramClient, status: Message):
     try:
         await status.edit_text("🧹 Очищаю профиль (имя, ава, описание)...")
-
         try:
             await client(UpdateProfileRequest(first_name=".", last_name="", about=""))
         except Exception as e:
@@ -242,7 +230,6 @@ async def clean_account(client: TelegramClient, status: Message):
             logger.warning(f"Фото: {e}")
 
         await status.edit_text("🧹 Выхожу из всех групп и каналов...")
-
         left = 0
         async for dialog in client.iter_dialogs():
             entity = dialog.entity
@@ -261,14 +248,11 @@ async def clean_account(client: TelegramClient, status: Message):
                 await asyncio.sleep(e.seconds + 1)
             except Exception:
                 continue
-
         await status.edit_text(f"✅ Очистка завершена (вышел из {left} чатов)")
     except Exception as e:
         logger.exception("Ошибка очистки")
         await status.edit_text(f"⚠️ Очистка с ошибками: {e}")
 
-
-# ====================== TELETHON ======================
 
 async def create_metadata(client: TelegramClient, phone: str) -> dict[str, Any]:
     me: User = await client.get_me()
@@ -369,8 +353,6 @@ async def finalize_and_send(message: Message, state: FSMContext, sess: ActiveSes
         await cleanup_user(chat_id, state)
 
 
-# ====================== ХЕНДЛЕРЫ ======================
-
 router = Router()
 
 
@@ -407,7 +389,6 @@ async def process_token(message: Message, state: FSMContext):
     chat_id = message.chat.id
     text = (message.text or "").strip()
 
-    # Админ может открыть панель даже в этом состоянии
     if text.lower() in ("/admin", "admin") and is_admin(message.from_user.id):
         await state.clear()
         await message.answer("🛠 <b>Админ-панель</b>", reply_markup=admin_kb())
@@ -490,8 +471,6 @@ async def cmd_cancel(event: Message | CallbackQuery, state: FSMContext):
     else:
         await event.answer(text, reply_markup=kb)
 
-
-# ---------- РЕЖИМ ПО НОМЕРУ ----------
 
 @router.callback_query(F.data == "mode_phone")
 async def cb_mode_phone(callback: CallbackQuery, state: FSMContext):
@@ -606,4 +585,24 @@ async def process_code(message: Message, state: FSMContext):
     except PhoneCodeExpiredError:
         await message.answer("❌ Код истёк. Начни заново.")
         await cleanup_user(chat_id, state)
-    exc
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: <code>{e}</code>")
+        await cleanup_user(chat_id, state)
+
+
+@router.callback_query(F.data == "mode_session")
+async def cb_mode_session(callback: CallbackQuery, state: FSMContext):
+    chat_id = callback.from_user.id
+    if chat_id not in AUTHORIZED:
+        await callback.answer("Нужен токен", show_alert=True)
+        return
+
+    await cleanup_user(chat_id, state)
+    active_sessions[chat_id] = ActiveSession(is_session_mode=True)
+    await state.set_state(States.waiting_session)
+
+    await callback.message.edit_text(
+        "📁 Отправь файл <b>.session</b>",
+        reply_markup=cancel_kb(),
+    )
+    await callback.an
