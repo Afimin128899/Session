@@ -3,8 +3,9 @@
 Telegram Session Migrator Bot
 - Вход по номеру телефона
 - Вход по .session
-- Режимы /auto и /manual
-- Доступ только по токену (админ-панель)
+- Режимы авто / ручной код
+- Доступ только по токену
+- Админ-панель
 - Очистка профиля + выход из всех чатов
 """
 
@@ -16,20 +17,16 @@ import logging
 import re
 import secrets
 import shutil
-import sys
 import tempfile
 import time
-import traceback
-import uuid
-import zipfile
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, Optional, Set
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import Command, StateFilter
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -41,7 +38,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
 )
-from pydantic import Field, ValidationError, field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from telethon import TelegramClient, events
 from telethon.errors import (
@@ -95,24 +92,7 @@ class Settings(BaseSettings):
         return set()
 
 
-print("[startup] Loading Settings...", flush=True)
-try:
-    settings = Settings()
-except (ValueError, ValidationError) as e:
-    # pydantic's ValidationError subclasses ValueError; print the exact cause
-    # so missing/invalid environment variables are visible in deploy logs.
-    print(f"[startup] FATAL: failed to load Settings: {e}", file=sys.stderr, flush=True)
-    print(
-        "[startup] Required environment variables: API_ID (int), API_HASH (str), BOT_TOKEN (str)",
-        file=sys.stderr,
-        flush=True,
-    )
-    raise
-except Exception as e:
-    print(f"[startup] FATAL: unexpected error while loading Settings: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
-    traceback.print_exc()
-    raise
-print("[startup] Settings loaded successfully", flush=True)
+settings = Settings()
 
 # ====================== ЛОГИРОВАНИЕ ======================
 
@@ -134,31 +114,21 @@ class States(StatesGroup):
     waiting_session = State()
 
 
-# ====================== ХРАНИЛИЩЕ ТОКЕНОВ ======================
+# ====================== ХРАНИЛИЩЕ ======================
 
-# token -> {"uses_left": int | None, "created_by": int, "created_at": datetime, "note": str}
 TOKENS: Dict[str, dict] = {}
-
-# chat_id -> True (авторизован)
 AUTHORIZED: Set[int] = set()
-
-# Режим кода для пользователя
 user_auto_mode: Dict[int, bool] = {}
-
 
 def is_admin(user_id: int) -> bool:
     return user_id in settings.admin_ids
 
-
 def get_auto_mode(chat_id: int) -> bool:
     return user_auto_mode.get(chat_id, settings.default_auto_code)
 
-
-def generate_token(length: int = 12) -> str:
+def generate_token(length: int = 10) -> str:
     return secrets.token_urlsafe(length)[:length].upper()
 
-
-# ====================== МОДЕЛИ ======================
 
 @dataclass
 class ActiveSession:
@@ -169,7 +139,6 @@ class ActiveSession:
     temp_dir: Optional[Path] = None
     created_at: datetime = field(default_factory=datetime.now)
     attempts: int = 0
-    last_code_sent_at: Optional[datetime] = None
     code_event: Optional[asyncio.Event] = None
     received_code: Optional[str] = None
     is_session_mode: bool = False
@@ -177,7 +146,6 @@ class ActiveSession:
 
 
 active_sessions: Dict[int, ActiveSession] = {}
-
 stats = {"started": 0, "success": 0, "failed": 0, "cancelled": 0, "tokens_used": 0}
 
 
@@ -203,9 +171,9 @@ def cancel_kb() -> InlineKeyboardMarkup:
 
 def admin_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Создать токен (1 использование)", callback_data="token_1")],
-        [InlineKeyboardButton(text="➕ Создать токен (5 использований)", callback_data="token_5")],
-        [InlineKeyboardButton(text="➕ Создать токен (безлимит)", callback_data="token_inf")],
+        [InlineKeyboardButton(text="➕ Токен (1 использование)", callback_data="token_1")],
+        [InlineKeyboardButton(text="➕ Токен (5 использований)", callback_data="token_5")],
+        [InlineKeyboardButton(text="➕ Токен (безлимит)", callback_data="token_inf")],
         [InlineKeyboardButton(text="📋 Список токенов", callback_data="token_list")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
     ])
@@ -300,7 +268,7 @@ async def clean_account(client: TelegramClient, status: Message):
         await status.edit_text(f"⚠️ Очистка с ошибками: {e}")
 
 
-# ====================== TELETHON HELPERS ======================
+# ====================== TELETHON ======================
 
 async def create_metadata(client: TelegramClient, phone: str) -> dict[str, Any]:
     me: User = await client.get_me()
@@ -361,14 +329,11 @@ async def finalize_and_send(message: Message, state: FSMContext, sess: ActiveSes
         sess.client = None
 
         session_file = temp_dir / f"{phone}.session"
-        original = Path(str(temp_dir / "session") + ".session")
-        if original.exists():
-            original.rename(session_file)
-        if not session_file.exists():
-            # для session-режима имя другое
-            original2 = Path(str(temp_dir / "new_session") + ".session")
-            if original2.exists():
-                original2.rename(session_file)
+        for name in ("session", "new_session"):
+            original = Path(str(temp_dir / name) + ".session")
+            if original.exists():
+                original.rename(session_file)
+                break
 
         if not session_file.exists():
             raise FileNotFoundError("Файл сессии не создан")
@@ -394,7 +359,7 @@ async def finalize_and_send(message: Message, state: FSMContext, sess: ActiveSes
             ),
         )
         stats["success"] += 1
-        await message.answer("Можно создать ещё одну сессию:", reply_markup=main_menu_kb())
+        await message.answer("Можно создать ещё:", reply_markup=main_menu_kb())
 
     except Exception as e:
         logger.exception("finalize error")
@@ -429,10 +394,26 @@ async def cmd_start(message: Message, state: FSMContext):
     )
 
 
+@router.message(Command("admin"))
+async def cmd_admin(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.clear()
+    await message.answer("🛠 <b>Админ-панель</b>", reply_markup=admin_kb())
+
+
 @router.message(States.waiting_token)
 async def process_token(message: Message, state: FSMContext):
     chat_id = message.chat.id
-    token = (message.text or "").strip().upper()
+    text = (message.text or "").strip()
+
+    # Админ может открыть панель даже в этом состоянии
+    if text.lower() in ("/admin", "admin") and is_admin(message.from_user.id):
+        await state.clear()
+        await message.answer("🛠 <b>Админ-панель</b>", reply_markup=admin_kb())
+        return
+
+    token = text.upper()
 
     if token not in TOKENS:
         await message.answer("❌ Неверный или несуществующий токен. Попробуй ещё раз:")
@@ -498,17 +479,16 @@ async def cmd_cancel(event: Message | CallbackQuery, state: FSMContext):
 
     text = "✅ Отменено."
     if chat_id in AUTHORIZED:
-        if isinstance(event, CallbackQuery):
-            await event.message.edit_text(text, reply_markup=main_menu_kb())
-        else:
-            await event.answer(text, reply_markup=main_menu_kb())
+        kb = main_menu_kb()
     else:
-        if isinstance(event, CallbackQuery):
-            await event.message.edit_text(text + "\n/start")
-        else:
-            await event.answer(text + "\n/start")
+        kb = None
+        text += "\n/start"
+
     if isinstance(event, CallbackQuery):
+        await event.message.edit_text(text, reply_markup=kb)
         await event.answer()
+    else:
+        await event.answer(text, reply_markup=kb)
 
 
 # ---------- РЕЖИМ ПО НОМЕРУ ----------
@@ -525,8 +505,7 @@ async def cb_mode_phone(callback: CallbackQuery, state: FSMContext):
     await state.set_state(States.waiting_phone)
 
     await callback.message.edit_text(
-        "📱 Пришли номер телефона в международном формате:\n"
-        "<code>79001234567</code> или <code>+79001234567</code>",
+        "📱 Пришли номер телефона:\n<code>79001234567</code> или <code>+79001234567</code>",
         reply_markup=cancel_kb(),
     )
     await callback.answer()
@@ -571,23 +550,12 @@ async def process_phone(message: Message, state: FSMContext):
 
         result = await client.send_code_request(phone)
         sess.phone_code_hash = result.phone_code_hash
-        sess.last_code_sent_at = datetime.now()
 
-        auto = get_auto_mode(chat_id)
-        if auto:
-            # В режиме авто по номеру код всё равно нужно вводить вручную
-            # (нет старой сессии). Поэтому просто просим код.
-            await state.set_state(States.waiting_code)
-            await status.edit_text(
-                f"📩 Код отправлен на <code>{phone}</code>\n\nВведи код:",
-                reply_markup=cancel_kb(),
-            )
-        else:
-            await state.set_state(States.waiting_code)
-            await status.edit_text(
-                f"📩 Код отправлен на <code>{phone}</code>\n\nВведи код:",
-                reply_markup=cancel_kb(),
-            )
+        await state.set_state(States.waiting_code)
+        await status.edit_text(
+            f"📩 Код отправлен на <code>{phone}</code>\n\nВведи код:",
+            reply_markup=cancel_kb(),
+        )
 
     except PhoneNumberInvalidError:
         await status.edit_text("❌ Неверный номер.")
@@ -624,41 +592,18 @@ async def process_code(message: Message, state: FSMContext):
         await cleanup_user(chat_id, state)
         return
 
-
-# ====================== ЗАПУСК ======================
-
-async def main() -> None:
-    print("[startup] Creating bot...", flush=True)
     try:
-        bot = Bot(
-            token=settings.bot_token,
-            default=DefaultBotProperties(parse_mode="HTML"),
-        )
-    except Exception as e:
-        print(f"[startup] FATAL: failed to create bot: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
-        traceback.print_exc()
-        raise
+        await sess.client.sign_in(phone=sess.phone, code=code, phone_code_hash=sess.phone_code_hash)
+        await message.answer("✅ Вход выполнен! Очищаю аккаунт…")
+        await finalize_and_send(message, state, sess)
 
-    dp = Dispatcher(storage=MemoryStorage())
-    dp.include_router(router)
+    except SessionPasswordNeededError:
+        await state.set_state(States.waiting_password)
+        await message.answer("🔒 Введи облачный пароль (2FA):", reply_markup=cancel_kb())
 
-    print("[startup] Starting dispatcher polling...", flush=True)
-    try:
-        await dp.start_polling(bot)
-    except Exception as e:
-        print(f"[startup] FATAL: dispatcher crashed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
-        traceback.print_exc()
-        raise
-    finally:
-        await bot.session.close()
-
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        print("[startup] Bot stopped", flush=True)
-    except Exception as e:
-        print(f"[startup] FATAL: unhandled error in main(): {type(e).__name__}: {e}", file=sys.stderr, flush=True)
-        traceback.print_exc()
-        sys.exit(1)
+    except PhoneCodeInvalidError:
+        await message.answer("❌ Неверный код. Попробуй ещё:", reply_markup=cancel_kb())
+    except PhoneCodeExpiredError:
+        await message.answer("❌ Код истёк. Начни заново.")
+        await cleanup_user(chat_id, state)
+    exc
