@@ -16,8 +16,10 @@ import logging
 import re
 import secrets
 import shutil
+import sys
 import tempfile
 import time
+import traceback
 import uuid
 import zipfile
 from dataclasses import dataclass, field
@@ -39,7 +41,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
 )
-from pydantic import Field, field_validator
+from pydantic import Field, ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from telethon import TelegramClient, events
 from telethon.errors import (
@@ -93,7 +95,24 @@ class Settings(BaseSettings):
         return set()
 
 
-settings = Settings()
+print("[startup] Loading Settings...", flush=True)
+try:
+    settings = Settings()
+except (ValueError, ValidationError) as e:
+    # pydantic's ValidationError subclasses ValueError; print the exact cause
+    # so missing/invalid environment variables are visible in deploy logs.
+    print(f"[startup] FATAL: failed to load Settings: {e}", file=sys.stderr, flush=True)
+    print(
+        "[startup] Required environment variables: API_ID (int), API_HASH (str), BOT_TOKEN (str)",
+        file=sys.stderr,
+        flush=True,
+    )
+    raise
+except Exception as e:
+    print(f"[startup] FATAL: unexpected error while loading Settings: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+    traceback.print_exc()
+    raise
+print("[startup] Settings loaded successfully", flush=True)
 
 # ====================== ЛОГИРОВАНИЕ ======================
 
@@ -602,4 +621,44 @@ async def process_code(message: Message, state: FSMContext):
     sess.attempts += 1
     if sess.attempts > 5:
         await message.answer("❌ Слишком много попыток.")
-        await cleanup_user
+        await cleanup_user(chat_id, state)
+        return
+
+
+# ====================== ЗАПУСК ======================
+
+async def main() -> None:
+    print("[startup] Creating bot...", flush=True)
+    try:
+        bot = Bot(
+            token=settings.bot_token,
+            default=DefaultBotProperties(parse_mode="HTML"),
+        )
+    except Exception as e:
+        print(f"[startup] FATAL: failed to create bot: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        traceback.print_exc()
+        raise
+
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(router)
+
+    print("[startup] Starting dispatcher polling...", flush=True)
+    try:
+        await dp.start_polling(bot)
+    except Exception as e:
+        print(f"[startup] FATAL: dispatcher crashed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        traceback.print_exc()
+        raise
+    finally:
+        await bot.session.close()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("[startup] Bot stopped", flush=True)
+    except Exception as e:
+        print(f"[startup] FATAL: unhandled error in main(): {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        traceback.print_exc()
+        sys.exit(1)
