@@ -4,6 +4,7 @@ Telegram Session Migrator Bot
 + Очистка профиля (имя, ава, био, выход из всех чатов)
 + Режим авто / ручной ввод кода
 + Очередь сессий
++ Создание новой сессии с нуля по номеру телефона (/new)
 """
 
 from __future__ import annotations
@@ -101,6 +102,7 @@ logger = logging.getLogger("SessionMigrator")
 # ====================== FSM ======================
 
 class MigrateStates(StatesGroup):
+    waiting_phone = State()
     waiting_password = State()
     waiting_manual_code = State()
 
@@ -132,6 +134,7 @@ class ActiveMigration:
     waiting_2fa: bool = False
     waiting_manual_code: bool = False
     queue_item: Optional[QueueItem] = None
+    is_new_session: bool = False  # True = создание с нуля по номеру
 
 
 user_auto_mode: Dict[int, bool] = {}
@@ -345,14 +348,23 @@ async def finalize(mig: ActiveMigration, message: Message, state: Optional[FSMCo
 
         data = zip_path.read_bytes()
 
-        caption = (
-            f"✅ <b>Новая сессия создана + очищена!</b>\n\n"
-            f"📞 <code>{phone}</code>\n"
-            f"🆔 <code>{metadata['id']}</code>\n"
-            f"👤 Имя/ава/био удалены\n"
-            f"🚪 Вышел из всех чатов\n"
-            f"🔒 Старая сессия завершена"
-        )
+        if mig.is_new_session:
+            caption = (
+                f"✅ <b>Новая сессия создана + очищена!</b>\n\n"
+                f"📞 <code>{phone}</code>\n"
+                f"🆔 <code>{metadata['id']}</code>\n"
+                f"👤 Имя/ава/био удалены\n"
+                f"🚪 Вышел из всех чатов"
+            )
+        else:
+            caption = (
+                f"✅ <b>Новая сессия создана + очищена!</b>\n\n"
+                f"📞 <code>{phone}</code>\n"
+                f"🆔 <code>{metadata['id']}</code>\n"
+                f"👤 Имя/ава/био удалены\n"
+                f"🚪 Вышел из всех чатов\n"
+                f"🔒 Старая сессия завершена"
+            )
 
         await message.answer_document(
             BufferedInputFile(data, filename=f"{phone}_new_session.zip"),
@@ -551,14 +563,16 @@ async def cmd_start(message: Message, state: FSMContext):
     mode = "авто" if get_auto_mode(chat_id) else "ручной"
     await message.answer(
         "🔄 <b>Мигратор сессий</b>\n\n"
-        "Отправляй <b>.session</b> файлы (можно несколько — по очереди).\n\n"
-        f"Текущий режим кода: <b>{mode}</b>\n"
+        "Отправляй <b>.session</b> файлы (можно несколько — по очереди).\n"
+        "Или создай новую сессию с нуля: <b>/new</b>\n\n"
+        f"Текущий режим кода (для миграции): <b>{mode}</b>\n"
         "• /auto — ловить код автоматически\n"
-        "• /manual — вводить код вручную\n\n"
+        "• /manual — вводить код вручную\n"
+        "• /new — создать сессию по номеру телефона\n\n"
         "После входа бот:\n"
         "• Убирает имя, аву и описание\n"
         "• Выходит из всех чатов и каналов\n"
-        "• Завершает старую сессию",
+        "• Завершает старую сессию (при миграции)",
         reply_markup=cancel_kb(),
     )
 
@@ -573,6 +587,102 @@ async def cmd_auto(message: Message):
 async def cmd_manual(message: Message):
     user_auto_mode[message.chat.id] = False
     await message.answer("✅ Режим: <b>ручной</b>")
+
+
+@router.message(Command("new", "create"))
+async def cmd_new(message: Message, state: FSMContext):
+    chat_id = message.chat.id
+
+    # Нельзя запускать, если уже идёт миграция или очередь
+    if chat_id in current_migration:
+        await message.answer("❌ Уже идёт обработка. Сначала /cancel")
+        return
+    if user_queues.get(chat_id):
+        await message.answer("❌ Есть активная очередь. Сначала /cancel")
+        return
+
+    await state.set_state(MigrateStates.waiting_phone)
+    await message.answer(
+        "📱 <b>Создание новой сессии</b>\n\n"
+        "Отправь номер телефона в международном формате:\n"
+        "<code>+79001234567</code>\n\n"
+        "Бот запросит код и создаст чистую сессию.",
+        reply_markup=cancel_kb(),
+    )
+
+
+@router.message(MigrateStates.waiting_phone)
+async def process_phone(message: Message, state: FSMContext):
+    chat_id = message.chat.id
+    raw = (message.text or "").strip().replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+
+    if not raw:
+        await message.answer("❌ Отправь номер телефона.")
+        return
+
+    # Нормализация номера
+    if raw.startswith("8") and len(raw) == 11:
+        raw = "+7" + raw[1:]
+    elif raw.startswith("7") and len(raw) == 11:
+        raw = "+" + raw
+    elif not raw.startswith("+"):
+        raw = "+" + raw
+
+    if not re.fullmatch(r"\+\d{10,15}", raw):
+        await message.answer("❌ Неверный формат. Пример: <code>+79001234567</code>")
+        return
+
+    phone = raw
+    mig_id = str(uuid.uuid4())[:8]
+
+    status = await message.answer(f"⏳ Создаю клиент для <code>{phone}</code>...")
+
+    mig = ActiveMigration(
+        id=mig_id,
+        chat_id=chat_id,
+        phone=phone,
+        status_message=status,
+        is_new_session=True,
+        waiting_manual_code=True,
+    )
+    current_migration[chat_id] = mig
+
+    try:
+        mig.temp_dir = Path(tempfile.mkdtemp(prefix=f"new_{chat_id}_{mig_id}_"))
+        new_session_path = str(mig.temp_dir / "new_session")
+
+        new_client = TelegramClient(
+            new_session_path,
+            settings.api_id,
+            settings.api_hash,
+            device_model=settings.device_model,
+            system_version=settings.system_version,
+            app_version=settings.app_version,
+            lang_code=settings.lang_code,
+            system_lang_code=settings.system_lang_code,
+        )
+        await new_client.connect()
+        mig.new_client = new_client
+
+        result = await new_client.send_code_request(phone)
+        mig.phone_code_hash = result.phone_code_hash
+
+        stats["started"] += 1
+
+        await state.set_state(MigrateStates.waiting_manual_code)
+        await status.edit_text(
+            f"📩 Код отправлен на <code>{phone}</code>\n\n"
+            "Введи код из SMS / Telegram:",
+            reply_markup=cancel_kb(),
+        )
+
+    except FloodWaitError as e:
+        await status.edit_text(f"❌ FloodWait: подожди {e.seconds} сек.")
+        await cleanup_migration(mig, state)
+    except Exception as e:
+        logger.exception("Ошибка при запросе кода для новой сессии")
+        await status.edit_text(f"❌ Ошибка: <code>{e}</code>")
+        await cleanup_migration(mig, state)
 
 
 @router.message(Command("cancel"))
@@ -593,6 +703,12 @@ async def cmd_cancel(event: Message | CallbackQuery, state: FSMContext):
 @router.message(F.document)
 async def process_session_file(message: Message, state: FSMContext):
     chat_id = message.chat.id
+
+    current_state = await state.get_state()
+    if current_state is not None:
+        await message.answer("❌ Сейчас идёт другой процесс. Сначала /cancel")
+        return
+
     doc: Document = message.document
 
     if not doc.file_name or not doc.file_name.lower().endswith(".session"):
