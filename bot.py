@@ -44,13 +44,12 @@ from telethon.errors import (
     SessionPasswordNeededError,
     FloodWaitError,
 )
-from telethon.tl.functions.account import UpdateProfileRequest, GetAuthorizationsRequest
+from telethon.tl.functions.account import UpdateProfileRequest
 from telethon.tl.functions.auth import ResetAuthorizationsRequest
 from telethon.tl.functions.photos import DeletePhotosRequest, GetUserPhotosRequest
-from telethon.tl.functions.messages import DeleteHistoryRequest
-from telethon.tl.types import User, InputPhoto, Channel, Chat
 from telethon.tl.functions.channels import LeaveChannelRequest
 from telethon.tl.functions.messages import DeleteChatUserRequest
+from telethon.tl.types import User, InputPhoto, Channel, Chat
 
 # ====================== КОНФИГ ======================
 
@@ -64,8 +63,6 @@ class Settings(BaseSettings):
     admin_ids: Set[int] = Field(default_factory=set)
     session_timeout_minutes: int = 15
     max_queue_per_user: int = 10
-
-    # По умолчанию авто-получение кода
     default_auto_code: bool = True
 
     device_model: str = "SLANFB5Z-EXTREME"
@@ -135,9 +132,7 @@ class ActiveMigration:
     queue_item: Optional[QueueItem] = None
 
 
-# Режим авто/ручной для каждого пользователя
 user_auto_mode: Dict[int, bool] = {}
-
 user_queues: Dict[int, List[QueueItem]] = {}
 current_migration: Dict[int, ActiveMigration] = {}
 queue_workers: Dict[int, bool] = {}
@@ -202,22 +197,20 @@ async def clear_user_queue(chat_id: int, state: Optional[FSMContext] = None):
 # ====================== ОЧИСТКА АККАУНТА ======================
 
 async def clean_account(client: TelegramClient, status: Message):
-    """Убирает имя, аву, био и выходит из всех чатов/каналов."""
     try:
         await status.edit_text("🧹 Очищаю профиль (имя, ава, описание)...")
 
-        # 1. Убираем имя и био
+        # Убираем имя и био
         try:
             await client(UpdateProfileRequest(
                 first_name=".",
                 last_name="",
                 about=""
             ))
-            logger.info("Профиль очищен (имя + био)")
         except Exception as e:
             logger.warning(f"Не удалось очистить профиль: {e}")
 
-        # 2. Удаляем все фото профиля
+        # Удаляем все фото
         try:
             photos = await client(GetUserPhotosRequest(
                 user_id="me",
@@ -234,30 +227,25 @@ async def clean_account(client: TelegramClient, status: Message):
                     ) for p in photos.photos
                 ]
                 await client(DeletePhotosRequest(id=input_photos))
-                logger.info(f"Удалено фото: {len(input_photos)}")
         except Exception as e:
             logger.warning(f"Не удалось удалить фото: {e}")
 
         await status.edit_text("🧹 Выхожу из всех групп и каналов...")
 
-        # 3. Выходим из всех групп и каналов
         left = 0
         async for dialog in client.iter_dialogs():
             entity = dialog.entity
             try:
                 if isinstance(entity, Channel):
-                    # Канал или супергруппа
                     await client(LeaveChannelRequest(entity))
                     left += 1
                 elif isinstance(entity, Chat):
-                    # Обычная группа
                     await client(DeleteChatUserRequest(
                         chat_id=entity.id,
                         user_id="me"
                     ))
                     left += 1
 
-                # Антифлуд
                 if left % 15 == 0:
                     await asyncio.sleep(1.5)
                 else:
@@ -268,7 +256,6 @@ async def clean_account(client: TelegramClient, status: Message):
             except Exception:
                 continue
 
-        logger.info(f"Вышел из {left} чатов/каналов")
         await status.edit_text(f"✅ Очистка завершена (вышел из {left} чатов)")
 
     except Exception as e:
@@ -315,24 +302,21 @@ async def finalize(mig: ActiveMigration, message: Message, state: Optional[FSMCo
         if not client or not await client.is_user_authorized():
             raise AuthKeyUnregisteredError("Новая сессия не авторизована")
 
-        # ===== ОЧИСТКА АККАУНТА =====
+        # Очистка аккаунта
         await clean_account(client, status)
 
-        # 1. Выходим из старой сессии
+        # Выходим из старой сессии
         if mig.old_client:
             try:
                 if mig.old_client.is_connected():
                     await mig.old_client.log_out()
-                    logger.info(f"[{mig.id}] Старая сессия вышла")
             except Exception as e:
-                logger.warning(f"[{mig.id}] log_out: {e}")
+                logger.warning(f"log_out: {e}")
 
-        # 2. ResetAuthorizations
         try:
             await client(ResetAuthorizationsRequest())
-            logger.info(f"[{mig.id}] ResetAuthorizations OK")
         except Exception as e:
-            logger.warning(f"[{mig.id}] ResetAuthorizations: {e}")
+            logger.warning(f"ResetAuthorizations: {e}")
 
         await asyncio.sleep(1.2)
 
@@ -374,10 +358,9 @@ async def finalize(mig: ActiveMigration, message: Message, state: Optional[FSMCo
         )
 
         stats["success"] += 1
-        logger.info(f"[{mig.id}] Успех {phone}")
 
     except Exception as e:
-        logger.exception(f"[{mig.id}] Ошибка финализации")
+        logger.exception("Ошибка финализации")
         stats["failed"] += 1
         await message.answer(f"❌ Ошибка: <code>{e}</code>")
     finally:
@@ -412,7 +395,6 @@ async def process_one_session(item: QueueItem, bot: Bot, state: FSMContext):
 
         shutil.copy(item.file_path, old_session_path)
 
-        # Старый клиент
         old_client = TelegramClient(
             str(old_session_path.with_suffix("")),
             settings.api_id,
@@ -445,7 +427,6 @@ async def process_one_session(item: QueueItem, bot: Bot, state: FSMContext):
             f"✅ <b>{item.original_name}</b>\n📞 <code>{phone}</code>\n\n⏳ Запрашиваю код..."
         )
 
-        # Новый клиент
         new_client = TelegramClient(
             new_session_path,
             settings.api_id,
@@ -462,9 +443,7 @@ async def process_one_session(item: QueueItem, bot: Bot, state: FSMContext):
         result = await new_client.send_code_request(phone)
         mig.phone_code_hash = result.phone_code_hash
 
-        # ===== РЕЖИМ КОДА =====
         if auto_mode:
-            # Автоматический
             mig.code_event = asyncio.Event()
             mig.received_code = None
 
@@ -474,7 +453,6 @@ async def process_one_session(item: QueueItem, bot: Bot, state: FSMContext):
                     match = re.search(r"\b(\d{5,6})\b", event.raw_text)
                     if match:
                         mig.received_code = match.group(1)
-                        logger.info(f"[{mig.id}] Код получен: {mig.received_code}")
                         mig.code_event.set()
 
             await status.edit_text("📩 Код запрошен. Жду от 777000...")
@@ -482,21 +460,19 @@ async def process_one_session(item: QueueItem, bot: Bot, state: FSMContext):
             try:
                 await asyncio.wait_for(mig.code_event.wait(), timeout=90)
             except asyncio.TimeoutError:
-                await status.edit_text(f"❌ Код не пришёл. Попробуй /manual и введи сам.")
+                await status.edit_text("❌ Код не пришёл. Попробуй /manual")
                 await cleanup_migration(mig)
                 return
 
             code = mig.received_code
         else:
-            # Ручной режим
             mig.waiting_manual_code = True
             await state.set_state(MigrateStates.waiting_manual_code)
             await status.edit_text(
-                f"📩 Код отправлен на <code>{phone}</code>\n\n"
-                f"Введи код вручную:",
+                f"📩 Код отправлен на <code>{phone}</code>\n\nВведи код вручную:",
                 reply_markup=cancel_kb(),
             )
-            return  # Ждём ввода в хендлере
+            return
 
         if not code:
             await status.edit_text("❌ Не удалось получить код.")
@@ -513,19 +489,15 @@ async def process_one_session(item: QueueItem, bot: Bot, state: FSMContext):
         except SessionPasswordNeededError:
             mig.waiting_2fa = True
             await state.set_state(MigrateStates.waiting_password)
-            await status.edit_text(
-                f"🔒 Нужен облачный пароль (2FA).\nОтправь пароль:",
-                reply_markup=cancel_kb(),
-            )
+            await status.edit_text("🔒 Нужен облачный пароль (2FA). Отправь пароль:", reply_markup=cancel_kb())
             return
 
         except Exception as e:
-            logger.exception(f"[{mig.id}] Ошибка sign_in")
             await status.edit_text(f"❌ Ошибка входа: <code>{e}</code>")
             await cleanup_migration(mig)
 
     except Exception as e:
-        logger.exception(f"[{mig.id}] Ошибка")
+        logger.exception("Ошибка process_one_session")
         await status.edit_text(f"❌ Ошибка: <code>{e}</code>")
         await cleanup_migration(mig)
 
@@ -550,7 +522,6 @@ async def queue_worker(chat_id: int, bot: Bot, state: FSMContext):
 
         await process_one_session(item, bot, state)
 
-        # Если ушли в ожидание кода/2FA — воркер останавливается
         mig = current_migration.get(chat_id)
         if mig and (mig.waiting_2fa or mig.waiting_manual_code):
             queue_workers[chat_id] = False
@@ -590,13 +561,13 @@ async def cmd_start(message: Message, state: FSMContext):
 @router.message(Command("auto"))
 async def cmd_auto(message: Message):
     user_auto_mode[message.chat.id] = True
-    await message.answer("✅ Режим: <b>автоматический</b> (код ловится сам)")
+    await message.answer("✅ Режим: <b>автоматический</b>")
 
 
 @router.message(Command("manual"))
 async def cmd_manual(message: Message):
     user_auto_mode[message.chat.id] = False
-    await message.answer("✅ Режим: <b>ручной</b> (будешь вводить код сам)")
+    await message.answer("✅ Режим: <b>ручной</b>")
 
 
 @router.message(Command("cancel"))
@@ -606,5 +577,48 @@ async def cmd_cancel(event: Message | CallbackQuery, state: FSMContext):
     await clear_user_queue(chat_id, state)
     stats["cancelled"] += 1
 
-    text = "✅ Очередь и текущая обработка отменены."
-    if isinstanc
+    text = "✅ Очередь отменена."
+    if isinstance(event, CallbackQuery):
+        await event.message.edit_text(text)
+        await event.answer()
+    else:
+        await event.answer(text)
+
+
+@router.message(F.document)
+async def process_session_file(message: Message, state: FSMContext):
+    chat_id = message.chat.id
+    doc: Document = message.document
+
+    if not doc.file_name or not doc.file_name.lower().endswith(".session"):
+        await message.answer("❌ Нужен файл <code>.session</code>")
+        return
+
+    if len(user_queues.get(chat_id, [])) >= settings.max_queue_per_user:
+        await message.answer(f"❌ Очередь полная (макс. {settings.max_queue_per_user})")
+        return
+
+    temp_dir = Path(tempfile.mkdtemp(prefix=f"queue_{chat_id}_"))
+    file_path = temp_dir / doc.file_name
+    await message.bot.download(doc, destination=file_path)
+
+    item = QueueItem(
+        id=str(uuid.uuid4())[:8],
+        chat_id=chat_id,
+        file_path=file_path,
+        original_name=doc.file_name,
+    )
+
+    if chat_id not in user_queues:
+        user_queues[chat_id] = []
+    user_queues[chat_id].append(item)
+
+    pos = len(user_queues[chat_id])
+    mode = "авто" if get_auto_mode(chat_id) else "ручной"
+    await message.answer(
+        f"📥 <b>{doc.file_name}</b> добавлен в очередь (позиция {pos})\n"
+        f"Режим кода: <b>{mode}</b>",
+        reply_markup=cancel_kb(),
+    )
+
+   
