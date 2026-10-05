@@ -66,7 +66,7 @@ from telethon.tl.functions.account import (
     UpdateProfileRequest,
     UpdateUsernameRequest,
 )
-from telethon.tl.functions.auth import ResetAuthorizationsRequest
+from telethon.tl.functions.auth import ResetAuthorizationsRequest, LogOutRequest
 from telethon.tl.functions.channels import DeleteChannelRequest, LeaveChannelRequest
 from telethon.tl.functions.contacts import (
     BlockRequest,
@@ -859,15 +859,27 @@ async def finalize(mig: ActiveMigration, message: Message, state: Optional[FSMCo
         if not client or not await client.is_user_authorized():
             raise AuthKeyUnregisteredError("Клиент не авторизован")
 
-        # 1. ЗАВЕРШАЕМ СТАРУЮ СЕССИЮ ПЕРВЫМ ДЕЛОМ (пока сокет не отвалился по таймауту)
+        # ====================================================================
+        # 1. ЖЕСТКОЕ ЗАВЕРШЕНИЕ СТАРОЙ СЕССИИ (ОБХОД БЛОКИРОВОК SQLITE)
+        # ====================================================================
         if mig.old_client:
             try:
+                await reporter.update("☠️ Уничтожение старой сессии (LogOut)...", force=True)
                 if not mig.old_client.is_connected():
                     await mig.old_client.connect()
-                await mig.old_client.log_out()
-                logger.info(f"Старая сессия для {phone} успешно деавторизована.")
+                
+                # Прямой API-запрос на сервер (гарантированно отзывает ключ)
+                await mig.old_client(LogOutRequest())
+                logger.info(f"Старая сессия для {phone} УНИЧТОЖЕНА.")
             except Exception as e:
-                logger.warning(f"Не удалось завершить старую сессию через log_out: {e}")
+                logger.warning(f"Ошибка при выходе из старой сессии: {e}")
+            finally:
+                try:
+                    await mig.old_client.disconnect()
+                except Exception:
+                    pass
+                mig.old_client = None  # Защита от повторных вызовов
+        # ====================================================================
 
         # 2. Очищаем аккаунт на новой активной сессии
         clean_info = await deep_clean_account(client, reporter)
