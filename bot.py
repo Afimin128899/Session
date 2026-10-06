@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
 """
 Telegram Session Migrator & Bulk Cleaner v100x+ Extreme Industrial
-+ Гарантированное завершение старой сессии (мгновенный LogOutRequest с реконнектом)
-+ Мультипоточный Semaphore-воркер (параллельная обработка очередей)
-+ Пре-валидация прокси перед инициализацией сокетов (anti-hang)
-+ Уничтожение платежных данных (ClearSavedInfoRequest)
-+ Сброс облачного поискового графа (ResetSavedRequest)
-+ Установка минимального срока жизни аккаунта (SetAccountTTLRequest: 30 days)
-+ Персистентная очередь в SQLite с транзакционной целостностью
-+ Graceful Shutdown при перезагрузке контейнера или сервера
++ Полная очистка и миграция сессий Telethon
++ Исправлено экранирование спецсимволов HTML для Telegram API
++ Гарантированное завершение старой сессии через LogOutRequest
++ Мультипоточная обработка очередей с использованием SQLite
 """
 
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import random
@@ -114,7 +111,7 @@ class Settings(BaseSettings):
     admin_ids: Set[int] = Field(default_factory=set)
     session_timeout_minutes: int = 15
     max_queue_per_user: int = 150
-    default_auto_code: int = 1  # 1 = Auto Migrate, 2 = Fast Clean, 0 = Manual
+    default_auto_code: int = 1
     concurrent_workers_per_chat: int = 3
     db_file: str = "sessions_v100x.db"
 
@@ -226,11 +223,6 @@ class Database:
                 conn.commit()
                 return dict(row)
         return None
-
-    def release_item_status(self, item_id: str, status: str = "pending"):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("UPDATE queue SET status = ? WHERE id = ?", (status, item_id))
-            conn.commit()
 
     def remove_item(self, item_id: str):
         with sqlite3.connect(self.db_path) as conn:
@@ -833,7 +825,7 @@ async def process_fast_clean_session(item: dict, bot: Bot, state: Optional[FSMCo
             f"💳 Платежные данные: <b>Уничтожены</b>\n"
             f"⏳ TTL аккаунта: <b>30 дней</b>\n"
             f"🔒 Privacy Lockdown: <b>Включен</b>\n"
-            f"🌐 Сессии: <b>{'Сброшены' if clean_report.sessions_reset else 'Пропущены (<24ч)'}</b>"
+            f"🌐 Сессии: <b>{'Сброшены' if clean_report.sessions_reset else 'Пропущены (&lt; 24ч)'}</b>"
         )
 
         await bot.send_document(
@@ -914,10 +906,10 @@ async def finalize(mig: ActiveMigration, message: Message, state: Optional[FSMCo
             clean_info.sessions_reset = True
         except FreshResetAuthorisationForbiddenError:
             clean_info.sessions_reset = False
-            clean_info.sessions_reset_warning = "Сессия свежая (< 24 ч, лимит Telegram)"
+            clean_info.sessions_reset_warning = "Сессия свежая (&lt; 24 ч, лимит Telegram)"
         except Exception as e:
             clean_info.sessions_reset = False
-            clean_info.sessions_reset_warning = str(e)
+            clean_info.sessions_reset_warning = html.escape(str(e))
 
         metadata = await create_metadata(client, phone, mig.fingerprint)
         await client.disconnect()
@@ -947,13 +939,14 @@ async def finalize(mig: ActiveMigration, message: Message, state: Optional[FSMCo
         elif mig.old_session_terminated:
             old_status = "✅ Завершена (Log Out)"
         else:
-            old_status = f"❌ Сбой деавторизации ({mig.old_session_error or 'Сетевая ошибка'})"
+            safe_err = html.escape(mig.old_session_error or 'Сетевая ошибка')
+            old_status = f"❌ Сбой деавторизации ({safe_err})"
 
         caption = (
             f"⚡ <b>Сессия мигрирована и очищена по v100x+</b>\n\n"
-            f"📞 Телефон: <code>{phone}</code>\n"
+            f"📞 Телефон: <code>{html.escape(phone)}</code>\n"
             f"🆔 ID: <code>{metadata['id']}</code>\n"
-            f"💻 Устройство: <code>{mig.fingerprint['device']} ({mig.fingerprint['sys']})</code>\n"
+            f"💻 Устройство: <code>{html.escape(mig.fingerprint['device'])} ({html.escape(mig.fingerprint['sys'])})</code>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"🔒 <b>Старая сессия: {old_status}</b>\n"
             f"👤 Профиль и @username: <b>Очищены</b>\n"
@@ -977,7 +970,7 @@ async def finalize(mig: ActiveMigration, message: Message, state: Optional[FSMCo
     except Exception as e:
         logger.exception("Ошибка финализации")
         stats["failed"] += 1
-        await message.answer(f"❌ Ошибка миграции: <code>{e}</code>")
+        await message.answer(f"❌ Ошибка миграции: <code>{html.escape(str(e))}</code>")
     finally:
         await cleanup_migration(mig, state)
 
@@ -1133,7 +1126,7 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
                     await finalize(mig, status, state)
                     return
                 except PasswordHashInvalidError:
-                    await reporter.update("⚠️ Пароль 2FA из JSON не подошел. Введите вручную:", force=True)
+                    await reporter.update("⚠️️ Пароль 2FA из JSON не подошел. Введите вручную:", force=True)
 
             mig.waiting_2fa = True
             mig.last_activity = time.time()
