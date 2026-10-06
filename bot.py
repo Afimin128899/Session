@@ -184,7 +184,7 @@ class Database:
         self._init_db()
 
     def _init_db(self):
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS queue (
                     id TEXT PRIMARY KEY,
@@ -206,7 +206,7 @@ class Database:
             conn.commit()
 
     def add_queue_item(self, item_id: str, chat_id: int, file_path: str, original_name: str, auto_2fa: Optional[str], proxy_dict: Optional[dict]):
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
             conn.execute(
                 "INSERT INTO queue (id, chat_id, file_path, original_name, auto_2fa, proxy_json, status) VALUES (?, ?, ?, ?, ?, ?, 'pending')",
                 (item_id, chat_id, file_path, original_name, auto_2fa, json.dumps(proxy_dict) if proxy_dict else None),
@@ -214,7 +214,7 @@ class Database:
             conn.commit()
 
     def pop_next_item(self, chat_id: int) -> Optional[dict]:
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             cur.execute(
@@ -229,18 +229,18 @@ class Database:
         return None
 
     def release_item_status(self, item_id: str, status: str = "pending"):
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
             conn.execute("UPDATE queue SET status = ? WHERE id = ?", (status, item_id))
             conn.commit()
 
     def remove_item(self, item_id: str):
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
             conn.execute("DELETE FROM queue WHERE id = ?", (item_id,))
             conn.commit()
 
     def clear_chat_queue(self, chat_id: int) -> List[str]:
         files_to_remove = []
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             cur.execute("SELECT file_path FROM queue WHERE chat_id = ?", (chat_id,))
@@ -250,18 +250,18 @@ class Database:
         return files_to_remove
 
     def count_queue(self, chat_id: int) -> int:
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
             cur = conn.cursor()
             cur.execute("SELECT COUNT(*) FROM queue WHERE chat_id = ? AND status = 'pending'", (chat_id,))
             return cur.fetchone()[0]
 
     def set_clean_mode(self, chat_id: int, mode: int):
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
             conn.execute("INSERT OR REPLACE INTO settings (chat_id, auto_mode) VALUES (?, ?)", (chat_id, mode))
             conn.commit()
 
     def get_clean_mode(self, chat_id: int, default: int = 1) -> int:
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
             cur = conn.cursor()
             cur.execute("SELECT auto_mode FROM settings WHERE chat_id = ?", (chat_id,))
             row = cur.fetchone()
@@ -380,7 +380,8 @@ class StatusReporter:
         if not force and (now - self.last_update < self.interval or text == self.last_text):
             return
         try:
-            await self.message.edit_text(text, reply_markup=reply_markup)
+            safe_text = text.replace("<", "&lt;").replace(">", "&gt;")
+            await self.message.edit_text(safe_text, reply_markup=reply_markup, parse_mode="HTML")
             self.last_update = now
             self.last_text = text
         except Exception:
@@ -1474,7 +1475,7 @@ async def process_2fa(message: Message, state: FSMContext):
 async def cmd_stats(message: Message):
     if not is_admin(message.from_user.id):
         return
-    with sqlite3.connect(settings.db_file) as conn:
+    with sqlite3.connect(settings.db_file, timeout=30.0) as conn:
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) FROM queue WHERE status = 'pending'")
         total_in_db = cur.fetchone()[0]
