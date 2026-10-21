@@ -164,6 +164,35 @@ class InterfaceTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(bot.current_migration, {-300: mig}):
             self.assertIn('2FA', bot.queue_status_text(-300))
 
+    async def test_phone_step_waits_for_explicit_code_request(self):
+        message = AsyncMock()
+        message.chat.id = -301
+        message.text = '+79001234567'
+        state = AsyncMock()
+        await bot.process_phone(message, state)
+        state.update_data.assert_awaited_once_with(pending_phone='+79001234567')
+        callbacks = {
+            button.callback_data
+            for row in message.answer.call_args.kwargs['reply_markup'].inline_keyboard
+            for button in row
+        }
+        self.assertEqual(callbacks, {'request_login_code', 'cancel_all'})
+        self.assertNotIn(-301, bot.current_migration)
+
+    async def test_code_request_requires_pending_phone(self):
+        call = AsyncMock()
+        call.message.chat.id = -302
+        state = AsyncMock()
+        state.get_data.return_value = {}
+        await bot.cb_request_login_code(call, state)
+        call.answer.assert_awaited_once()
+        self.assertTrue(call.answer.call_args.kwargs['show_alert'])
+
+    async def test_status_shows_current_item_safely(self):
+        with patch.dict(bot.queue_current_items, {-303: 'account <one>.session'}):
+            text = bot.queue_status_text(-303)
+        self.assertIn('account &lt;one&gt;.session', text)
+
     async def test_download_failure_removes_temporary_files(self):
         message = AsyncMock()
         message.chat.id = -400

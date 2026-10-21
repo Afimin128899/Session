@@ -370,6 +370,7 @@ current_migration: Dict[int, ActiveMigration] = {}
 queue_workers: Dict[int, bool] = {}
 queue_worker_tasks: Dict[int, asyncio.Task] = {}
 queue_paused: Dict[int, bool] = {}
+queue_current_items: Dict[int, str] = {}
 
 stats = {"started": 0, "success": 0, "failed": 0, "cancelled": 0, "skipped": 0}
 
@@ -559,6 +560,13 @@ def action_kb(can_skip: bool = True) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         buttons,
         [InlineKeyboardButton(text="Меню", callback_data="main_menu")],
+    ])
+
+
+def login_code_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Получить код", callback_data="request_login_code")],
+        [InlineKeyboardButton(text="Отмена", callback_data="cancel_all")],
     ])
 
 
@@ -1300,6 +1308,7 @@ async def queue_worker(chat_id: int, bot: Bot, state: FSMContext):
                 item = db.pop_next_item(chat_id)
                 if not item:
                     break
+                queue_current_items[chat_id] = item.get("original_name", "session")
 
                 rem = db.count_queue(chat_id)
                 if rem > 0:
@@ -1328,6 +1337,8 @@ async def queue_worker(chat_id: int, bot: Bot, state: FSMContext):
                         )
                     except Exception:
                         pass
+                finally:
+                    queue_current_items.pop(chat_id, None)
 
                 mig = current_migration.get(chat_id)
                 if mig and (mig.waiting_2fa or mig.waiting_manual_code):
@@ -1339,6 +1350,7 @@ async def queue_worker(chat_id: int, bot: Bot, state: FSMContext):
             await bot.send_message(chat_id, "✅ Очередь обработана")
     finally:
         queue_workers[chat_id] = False
+        queue_current_items.pop(chat_id, None)
         if queue_worker_tasks.get(chat_id) is current_task:
             queue_worker_tasks.pop(chat_id, None)
 
@@ -1392,7 +1404,12 @@ def queue_status_text(chat_id: int) -> str:
         activity = "Обработка"
     else:
         activity = "Нет активной миграции"
-    return f"<b>Статус</b>\n\n{activity}\nОжидают обработки: <b>{db.count_queue(chat_id)}</b>"
+    current = queue_current_items.get(chat_id)
+    current_line = f"\nТекущая: <code>{html.escape(current)}</code>" if current else ""
+    return (
+        f"<b>Статус</b>\n\n{activity}{current_line}\n"
+        f"Ожидают обработки: <b>{db.count_queue(chat_id)}</b>"
+    )
 
 
 @router.callback_query(F.data == "queue_status")
@@ -1419,6 +1436,24 @@ async def cb_resume_queue(call: CallbackQuery, state: FSMContext):
     start_queue_worker(chat_id, call.bot, state)
     await call.answer("Очередь продолжена")
     await call.message.edit_text(menu_text(chat_id), reply_markup=main_menu_kb(chat_id))
+
+
+@router.message(Command("pause"))
+async def cmd_pause(message: Message):
+    chat_id = message.chat.id
+    if db.count_queue(chat_id) == 0 and chat_id not in current_migration:
+        await message.answer("Очередь пуста.", reply_markup=main_menu_kb(chat_id))
+        return
+    queue_paused[chat_id] = True
+    await message.answer("Очередь приостановлена.", reply_markup=main_menu_kb(chat_id))
+
+
+@router.message(Command("resume"))
+async def cmd_resume(message: Message, state: FSMContext):
+    chat_id = message.chat.id
+    queue_paused[chat_id] = False
+    start_queue_worker(chat_id, message.bot, state)
+    await message.answer("Очередь продолжена.", reply_markup=main_menu_kb(chat_id))
 
 
 @router.callback_query(F.data == "show_help")
@@ -1544,6 +1579,7 @@ async def cmd_help(message: Message):
         "<b>Команды</b>\n\n"
         "/start — главное меню\n"
         "/status — статус очереди\n"
+        "/pause и /resume — приостановить или продолжить очередь\n"
         "/settings — вид меню\n"
         "/limits — ограничения файлов\n"
         "/privacy — информация о данных\n"
@@ -1645,7 +1681,6 @@ async def cmd_new(event: Message | CallbackQuery, state: FSMContext):
 
 @router.message(MigrateStates.waiting_phone)
 async def process_phone(message: Message, state: FSMContext):
-    chat_id = message.chat.id
     raw = (message.text or "").strip().replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
 
     if raw.startswith("8") and len(raw) == 11:
@@ -1658,12 +1693,26 @@ async def process_phone(message: Message, state: FSMContext):
         return
 
     phone = raw
+    await state.update_data(pending_phone=phone)
+    await message.answer(
+        f"Номер: <code>{phone}</code>\nНажмите «Получить код», чтобы запросить код в Telegram.",
+        reply_markup=login_code_kb(),
+    )
+
+
+async def start_new_session_code(message: Message, state: FSMContext, phone: str):
+    chat_id = message.chat.id
     mig_id = str(uuid.uuid4())[:8]
-    status = await message.answer(f"⏳ Создание сессии для <code>{phone}</code>...")
-
-    mig = ActiveMigration(id=mig_id, chat_id=chat_id, phone=phone, status_message=status, is_new_session=True, waiting_manual_code=True)
+    status = await message.answer(f"⏳ Запрашиваю код для <code>{phone}</code>...")
+    mig = ActiveMigration(
+        id=mig_id,
+        chat_id=chat_id,
+        phone=phone,
+        status_message=status,
+        is_new_session=True,
+        waiting_manual_code=True,
+    )
     current_migration[chat_id] = mig
-
     try:
         mig.temp_dir = Path(tempfile.mkdtemp(prefix=f"new_{chat_id}_{mig_id}_"))
         new_client = get_configured_client(str(mig.temp_dir / "new_session"), mig.fingerprint, None)
@@ -1685,6 +1734,22 @@ async def process_phone(message: Message, state: FSMContext):
         logger.exception("Ошибка запроса кода")
         await status.edit_text(f"❌ Ошибка запроса: <code>{public_error(e)}</code>")
         await cleanup_migration(mig, state)
+
+
+@router.callback_query(F.data == "request_login_code")
+async def cb_request_login_code(call: CallbackQuery, state: FSMContext):
+    chat_id = call.message.chat.id
+    data = await state.get_data()
+    phone = data.get("pending_phone")
+    if not phone or not re.fullmatch(r"\+\d{10,15}", str(phone)):
+        await call.answer("Сначала укажите номер телефона", show_alert=True)
+        return
+    if chat_id in current_migration or db.count_queue(chat_id) > 0:
+        await call.answer("Сначала завершите текущую обработку", show_alert=True)
+        return
+    await state.update_data(pending_phone=None)
+    await call.answer("Запрашиваю код")
+    await start_new_session_code(call.message, state, str(phone))
 
 
 @router.message(Command("cancel"))
@@ -1946,6 +2011,8 @@ async def main():
         await bot.set_my_commands([
             BotCommand(command="start", description="Главное меню"),
             BotCommand(command="status", description="Статус очереди"),
+            BotCommand(command="pause", description="Пауза очереди"),
+            BotCommand(command="resume", description="Продолжить очередь"),
             BotCommand(command="help", description="Меню и помощь"),
             BotCommand(command="settings", description="Настройки интерфейса"),
             BotCommand(command="limits", description="Ограничения файлов"),
