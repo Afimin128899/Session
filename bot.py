@@ -220,15 +220,54 @@ class Database:
                     compact_menu INTEGER NOT NULL DEFAULT 0
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS upload_limits (
+                    chat_id INTEGER PRIMARY KEY,
+                    max_sessions INTEGER NOT NULL CHECK (max_sessions > 0)
+                )
+            """)
             conn.commit()
 
     def add_queue_item(self, item_id: str, chat_id: int, file_path: str, original_name: str, auto_2fa: Optional[str], proxy_dict: Optional[dict]):
+        self.add_queue_items(chat_id, [(item_id, file_path, original_name, auto_2fa, proxy_dict)])
+
+    def add_queue_items(self, chat_id: int, items: List[Tuple]):
+        """Enforce the quota atomically, including items already processing."""
         with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
+            conn.execute("BEGIN IMMEDIATE")
+            used = conn.execute("SELECT COUNT(*) FROM queue WHERE chat_id = ?", (chat_id,)).fetchone()[0]
+            if used + len(items) > self._upload_limit(conn, chat_id):
+                raise ValueError("Превышен лимит сессий в очереди. Дождитесь обработки или сбросьте очередь.")
+            conn.executemany(
                 "INSERT INTO queue (id, chat_id, file_path, original_name, auto_2fa, proxy_json, status) VALUES (?, ?, ?, ?, ?, ?, 'pending')",
-                (item_id, chat_id, file_path, original_name, auto_2fa, json.dumps(proxy_dict) if proxy_dict else None),
+                [
+                    (item_id, chat_id, file_path, original_name, auto_2fa, json.dumps(proxy_dict) if proxy_dict else None)
+                    for item_id, file_path, original_name, auto_2fa, proxy_dict in items
+                ],
             )
             conn.commit()
+
+    def _upload_limit(self, conn: sqlite3.Connection, chat_id: int) -> int:
+        row = conn.execute("SELECT max_sessions FROM upload_limits WHERE chat_id = ?", (chat_id,)).fetchone()
+        return min(row[0], settings.max_queue_per_user) if row else settings.max_queue_per_user
+
+    def get_upload_limit(self, chat_id: int) -> int:
+        with sqlite3.connect(self.db_path) as conn:
+            return self._upload_limit(conn, chat_id)
+
+    def set_upload_limit(self, chat_id: int, limit: int):
+        if not 1 <= limit <= settings.max_queue_per_user:
+            raise ValueError(f"Допустимый лимит: от 1 до {settings.max_queue_per_user}.")
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO upload_limits (chat_id, max_sessions) VALUES (?, ?) "
+                "ON CONFLICT(chat_id) DO UPDATE SET max_sessions = excluded.max_sessions",
+                (chat_id, limit),
+            )
+
+    def count_outstanding(self, chat_id: int) -> int:
+        with sqlite3.connect(self.db_path) as conn:
+            return conn.execute("SELECT COUNT(*) FROM queue WHERE chat_id = ?", (chat_id,)).fetchone()[0]
 
     def pop_next_item(self, chat_id: int) -> Optional[dict]:
         with sqlite3.connect(self.db_path) as conn:
@@ -1468,7 +1507,7 @@ async def cb_help(call: CallbackQuery):
         "Миграция · вручную — код вводите вы.\n"
         "Быстрая очистка — удаление данных без переноса сессии.\n\n"
         "Файлы: .session или ZIP с парными JSON, до 20 МБ.\n"
-        f"Лимит очереди: {settings.max_queue_per_user} сессий.\n\n"
+        f"Лимит очереди: {db.get_upload_limit(call.message.chat.id)} сессий.\n\n"
         "/start — меню, /status — очередь, /cancel — отменить всё.\n"
         "Открытие меню не прерывает обработку.\n"
         "Миграция завершает старую сессию. Очистка удаляет данные аккаунта.",
@@ -1494,20 +1533,22 @@ def interface_settings_kb(chat_id: int) -> InlineKeyboardMarkup:
     label = "Краткий" if db.compact_menu(chat_id) else "Подробный"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"Вид меню: {label}", callback_data="toggle_compact_menu")],
+        [InlineKeyboardButton(text=f"Лимит загрузки: {db.get_upload_limit(chat_id)}", callback_data="upload_limits")],
         [InlineKeyboardButton(text="О данных", callback_data="show_privacy")],
         [InlineKeyboardButton(text="Ограничения файлов", callback_data="show_limits")],
         [InlineKeyboardButton(text="Меню", callback_data="main_menu")],
     ])
 
 
-def limits_text() -> str:
+def limits_text(chat_id: Optional[int] = None) -> str:
+    limit = db.get_upload_limit(chat_id) if chat_id is not None else settings.max_queue_per_user
     return (
         "<b>Ограничения файлов</b>\n\n"
         "Форматы: .session и .zip.\n"
         f"Размер загрузки: до {MAX_UPLOAD_BYTES // (1024 * 1024)} МБ.\n"
         f"Размер распакованного ZIP: до {MAX_EXTRACTED_BYTES // (1024 * 1024)} МБ.\n"
         f"Файлов и папок в ZIP: до {MAX_ARCHIVE_ENTRIES}.\n"
-        f"Сессий в очереди: до {settings.max_queue_per_user}.\n"
+        f"Сессий в очереди, включая обработку: до {limit}.\n"
         "ZIP с паролем, ссылками и выходом за пределы папки не принимаются."
     )
 
@@ -1527,7 +1568,50 @@ PRIVACY_TEXT = (
 
 @router.message(Command("settings"))
 async def cmd_interface_settings(message: Message):
-    await message.answer("<b>Настройки интерфейса</b>\nВыберите вид меню.", reply_markup=interface_settings_kb(message.chat.id))
+    await message.answer("<b>Настройки</b>\nВыберите вид меню или лимит загрузки.", reply_markup=interface_settings_kb(message.chat.id))
+
+
+def upload_limits_kb(chat_id: int) -> InlineKeyboardMarkup:
+    maximum = settings.max_queue_per_user
+    choices = sorted({n for n in (1, 5, 10, 25, 50, 100, maximum, db.get_upload_limit(chat_id)) if n <= maximum})
+    buttons = [InlineKeyboardButton(text=str(n), callback_data=f"set_upload_limit:{n}") for n in choices]
+    rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+    rows.append([InlineKeyboardButton(text="Назад", callback_data="interface_settings")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data == "upload_limits")
+async def cb_upload_limits(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Лимит меняет только администратор", show_alert=True)
+        return
+    chat_id = call.message.chat.id
+    await call.answer()
+    await call.message.answer(
+        f"<b>Лимит загрузки</b>\nСейчас: {db.get_upload_limit(chat_id)}.\n"
+        f"Занято: {db.count_outstanding(chat_id)}.\n\n"
+        "Лимит учитывает все ожидающие и обрабатываемые сессии этого чата. "
+        "Уменьшение лимита не удаляет ранее загруженные файлы.",
+        reply_markup=upload_limits_kb(chat_id),
+    )
+
+
+@router.callback_query(F.data.startswith("set_upload_limit:"))
+async def cb_set_upload_limit(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Лимит меняет только администратор", show_alert=True)
+        return
+    try:
+        limit = int(call.data.partition(":")[2])
+        db.set_upload_limit(call.message.chat.id, limit)
+    except ValueError as exc:
+        await call.answer(str(exc), show_alert=True)
+        return
+    await call.answer(f"Лимит: {limit}")
+    await call.message.answer(
+        f"Лимит загрузки: <b>{limit}</b>. Настройка сохранена.",
+        reply_markup=interface_settings_kb(call.message.chat.id),
+    )
 
 
 @router.callback_query(F.data == "interface_settings")
@@ -1556,7 +1640,7 @@ async def cb_privacy(call: CallbackQuery):
 
 @router.message(Command("limits"))
 async def cmd_limits(message: Message):
-    await message.answer(limits_text(), reply_markup=interface_settings_kb(message.chat.id))
+    await message.answer(limits_text(message.chat.id), reply_markup=interface_settings_kb(message.chat.id))
 
 
 @router.callback_query(F.data == "show_limits")
@@ -1780,7 +1864,7 @@ async def process_document_upload(message: Message, state: FSMContext):
     if doc.file_size and doc.file_size > MAX_UPLOAD_BYTES:
         await message.answer("Файл превышает 20 МБ.")
         return
-    remaining = settings.max_queue_per_user - db.count_queue(chat_id)
+    remaining = db.get_upload_limit(chat_id) - db.count_outstanding(chat_id)
     if remaining <= 0:
         await message.answer("Очередь заполнена. Дождитесь обработки или сбросьте её.")
         return
@@ -1796,7 +1880,7 @@ async def process_document_upload(message: Message, state: FSMContext):
         await message.answer("Не удалось скачать файл. Проверьте размер и повторите отправку.")
         return
 
-    added_count = 0
+    queued_items = []
 
     if name.lower().endswith(".zip"):
         try:
@@ -1814,33 +1898,30 @@ async def process_document_upload(message: Message, state: FSMContext):
                     except Exception:
                         pass
 
-                db.add_queue_item(
-                    item_id=str(uuid.uuid4())[:8],
-                    chat_id=chat_id,
-                    file_path=str(s_path),
-                    original_name=s_path.name,
-                    auto_2fa=str(auto_pass) if auto_pass else None,
-                    proxy_dict=proxy_dict,
-                )
-                added_count += 1
+                queued_items.append((
+                    str(uuid.uuid4()), str(s_path), s_path.name,
+                    str(auto_pass) if auto_pass else None, proxy_dict,
+                ))
 
         except Exception as e:
             await message.answer("Не удалось прочитать ZIP: " + public_archive_error(e))
             shutil.rmtree(temp_dir, ignore_errors=True)
             return
     else:
-        db.add_queue_item(
-            item_id=str(uuid.uuid4())[:8],
-            chat_id=chat_id,
-            file_path=str(archive_file),
-            original_name=doc.file_name,
-            auto_2fa=None,
-            proxy_dict=None,
-        )
-        added_count += 1
+        queued_items.append((str(uuid.uuid4()), str(archive_file), doc.file_name, None, None))
 
+    try:
+        db.add_queue_items(chat_id, queued_items)
+    except Exception as exc:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        error = html.escape(str(exc)) if isinstance(exc, ValueError) else "Не удалось сохранить очередь. Повторите загрузку."
+        await message.answer(error)
+        return
+
+    added_count = len(queued_items)
     stats["started"] += added_count
     total_queue = db.count_queue(chat_id)
+    queue_paused[chat_id] = True
 
     await message.answer(
         f"Сессий добавлено: <b>{added_count}</b>\n"
@@ -1850,9 +1931,6 @@ async def process_document_upload(message: Message, state: FSMContext):
         "Обработка начнётся после вашего подтверждения.",
         reply_markup=queued_review_kb(),
     )
-
-    queue_paused[chat_id] = True
-
 
 @router.message(MigrateStates.waiting_manual_code)
 async def process_manual_code(message: Message, state: FSMContext):
