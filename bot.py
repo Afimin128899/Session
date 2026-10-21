@@ -534,7 +534,7 @@ def main_menu_kb(chat_id: int) -> InlineKeyboardMarkup:
         mode_label = "Миграция · вручную"
 
     if queue_paused.get(chat_id, False):
-        queue_button = InlineKeyboardButton(text="Продолжить очередь", callback_data="resume_queue")
+        queue_button = InlineKeyboardButton(text="Проверить и запустить", callback_data="resume_queue")
     else:
         queue_button = InlineKeyboardButton(text="Пауза очереди", callback_data="pause_queue")
 
@@ -567,6 +567,14 @@ def login_code_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Получить код", callback_data="request_login_code")],
         [InlineKeyboardButton(text="Отмена", callback_data="cancel_all")],
+    ])
+
+
+def queued_review_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Проверить и запустить", callback_data="resume_queue")],
+        [InlineKeyboardButton(text="Сбросить очередь", callback_data="confirm_cancel")],
+        [InlineKeyboardButton(text="Меню", callback_data="main_menu")],
     ])
 
 
@@ -1845,11 +1853,14 @@ async def process_document_upload(message: Message, state: FSMContext):
 
     await message.answer(
         f"Сессий добавлено: <b>{added_count}</b>\n"
-        f"Всего в очереди: <b>{total_queue}</b>",
-        reply_markup=action_kb(can_skip=True),
+        f"В очереди: <b>{total_queue}</b>\n\n"
+        f"Выбран режим: <b>{MODE_LABELS.get(db.get_clean_mode(chat_id), 'Миграция · вручную')}</b>.\n"
+        "Миграция завершает старую сессию. Быстрая очистка удаляет данные аккаунта.\n"
+        "Обработка начнётся после вашего подтверждения.",
+        reply_markup=queued_review_kb(),
     )
 
-    start_queue_worker(chat_id, message.bot, state)
+    queue_paused[chat_id] = True
 
 
 @router.message(MigrateStates.waiting_manual_code)
