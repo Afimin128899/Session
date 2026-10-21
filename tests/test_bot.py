@@ -1,5 +1,6 @@
 """Offline checks: never connect Telegram accounts or open bundled sessions."""
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
 import stat
@@ -287,6 +288,78 @@ class InterfaceSettingsTests(unittest.IsolatedAsyncioTestCase):
             text = bot.limits_text()
         self.assertIn('до 7 МБ', text)
         self.assertIn('до 42', text)
+
+
+class UploadQuotaTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = str(Path(self.tmp.name) / 'quota.sqlite')
+        self.db = bot.Database(self.path)
+
+    def item(self, name):
+        return (name, 'unused.session', 'unused.session', None, None)
+
+    async def test_limit_persists_and_never_exceeds_server_cap(self):
+        self.db.set_upload_limit(1, 5)
+        self.assertEqual(bot.Database(self.path).get_upload_limit(1), 5)
+        self.assertEqual(self.db.get_upload_limit(2), bot.settings.max_queue_per_user)
+        for limit in (0, bot.settings.max_queue_per_user + 1):
+            with self.assertRaises(ValueError):
+                self.db.set_upload_limit(1, limit)
+        with patch.object(bot.settings, 'max_queue_per_user', 2):
+            self.assertEqual(self.db.get_upload_limit(1), 2)
+
+    async def test_over_quota_batch_is_rejected_without_partial_insert(self):
+        self.db.set_upload_limit(1, 2)
+        self.db.add_queue_items(1, [self.item('first')])
+        with self.assertRaises(ValueError):
+            self.db.add_queue_items(1, [self.item('second'), self.item('third')])
+        self.assertEqual(self.db.count_outstanding(1), 1)
+
+    async def test_processing_counts_and_lowering_limit_keeps_existing_items(self):
+        self.db.set_upload_limit(1, 2)
+        self.db.add_queue_items(1, [self.item('first'), self.item('second')])
+        self.db.pop_next_item(1)
+        self.assertEqual(self.db.count_queue(1), 1)
+        with self.assertRaises(ValueError):
+            self.db.add_queue_items(1, [self.item('third')])
+        self.db.set_upload_limit(1, 1)
+        self.assertEqual(self.db.count_outstanding(1), 2)
+
+    async def test_simultaneous_uploads_cannot_bypass_limit(self):
+        self.db.set_upload_limit(1, 3)
+        def upload(prefix):
+            try:
+                self.db.add_queue_items(1, [self.item(prefix + '1'), self.item(prefix + '2')])
+                return True
+            except ValueError:
+                return False
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = list(executor.map(upload, ('a', 'b')))
+        self.assertEqual(outcomes.count(True), 1)
+        self.assertEqual(self.db.count_outstanding(1), 2)
+
+    async def test_non_admin_cannot_change_limit(self):
+        call = AsyncMock()
+        call.message.chat.id = 1
+        call.from_user.id = 999
+        call.data = 'set_upload_limit:1'
+        with patch.object(bot, 'db', self.db), patch.object(bot, 'is_admin', return_value=False):
+            await bot.cb_set_upload_limit(call)
+        self.assertEqual(self.db.get_upload_limit(1), bot.settings.max_queue_per_user)
+        self.assertTrue(call.answer.call_args.kwargs['show_alert'])
+
+    async def test_admin_can_set_and_view_limit(self):
+        call = AsyncMock()
+        call.message.chat.id = 1
+        call.from_user.id = 123
+        call.data = 'set_upload_limit:5'
+        with patch.object(bot, 'db', self.db), patch.object(bot, 'is_admin', return_value=True):
+            await bot.cb_set_upload_limit(call)
+            self.assertIn('до 5.', bot.limits_text(1))
+        self.assertEqual(self.db.get_upload_limit(1), 5)
+        call.message.answer.assert_awaited_once()
 
 
 if __name__ == '__main__':
