@@ -207,6 +207,26 @@ class InterfaceTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(destination.exists())
         self.assertEqual(bot.db.count_queue(-400), 0)
 
+    async def test_uploaded_sessions_wait_for_explicit_start(self):
+        message = AsyncMock()
+        message.chat.id = -405
+        message.document.file_name = 'own.session'
+        message.document.file_size = 16
+        message.bot.download.side_effect = lambda doc, destination: Path(destination).write_bytes(b'local test session')
+        with tempfile.TemporaryDirectory() as root, patch.object(bot.tempfile, 'mkdtemp', return_value=str(Path(root) / 'upload')):
+            # tempfile's contract creates the requested directory.
+            Path(root, 'upload').mkdir()
+            with patch.object(bot, 'start_queue_worker') as start_worker:
+                await bot.process_document_upload(message, AsyncMock())
+                start_worker.assert_not_called()
+        self.assertTrue(bot.queue_paused[-405])
+        self.assertEqual(bot.db.count_queue(-405), 1)
+        markup = message.answer.call_args.kwargs['reply_markup']
+        callbacks = {button.callback_data for row in markup.inline_keyboard for button in row}
+        self.assertIn('resume_queue', callbacks)
+        bot.db.clear_chat_queue(-405)
+        bot.queue_paused.pop(-405, None)
+
 
 class LifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_polling_failure_releases_resources(self):
