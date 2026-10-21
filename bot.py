@@ -16,9 +16,9 @@ import logging
 import random
 import re
 import shutil
-import signal
 import socket
 import sqlite3
+import stat
 import tempfile
 import time
 import uuid
@@ -36,6 +36,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BufferedInputFile,
+    BotCommand,
     CallbackQuery,
     Document,
     InlineKeyboardButton,
@@ -109,10 +110,10 @@ class Settings(BaseSettings):
     bot_token: str
 
     admin_ids: Set[int] = Field(default_factory=set)
-    session_timeout_minutes: int = 15
-    max_queue_per_user: int = 150
+    session_timeout_minutes: int = Field(default=15, ge=1, le=1440)
+    max_queue_per_user: int = Field(default=150, ge=1, le=10000)
     default_auto_code: int = 1
-    concurrent_workers_per_chat: int = 3
+    concurrent_workers_per_chat: int = Field(default=3, ge=1, le=16)
     db_file: str = "sessions_v100x.db"
 
     proxy_protocol: Optional[str] = None
@@ -355,6 +356,55 @@ async def verify_proxy_alive(proxy: dict, timeout: float = 3.0) -> bool:
         return False
 
 
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+MAX_EXTRACTED_BYTES = 100 * 1024 * 1024
+MAX_ARCHIVE_ENTRIES = 1000
+
+
+def validate_upload_name(name: str) -> str:
+    if not name or "\\" in name or "/" in name or "\x00" in name:
+        raise ValueError("Недопустимое имя файла.")
+    if Path(name).suffix.lower() not in {".session", ".zip"}:
+        raise ValueError("Отправьте файл .session или .zip.")
+    return name
+
+
+def extract_session_archive(archive_file: Path, destination: Path, remaining: int) -> List[Path]:
+    # Validate every member before writing anything to disk.
+    with zipfile.ZipFile(archive_file) as archive:
+        entries = archive.infolist()
+        if len(entries) > MAX_ARCHIVE_ENTRIES:
+            raise ValueError("В архиве слишком много файлов.")
+        total = 0
+        seen = set()
+        sessions = []
+        root = destination.resolve()
+        for entry in entries:
+            name = entry.filename
+            path = Path(name)
+            if (not name or "\\" in name or "\x00" in name or path.is_absolute()
+                    or ".." in path.parts or ":" in name
+                    or stat.S_ISLNK(entry.external_attr >> 16)):
+                raise ValueError("Архив содержит недопустимые пути или ссылки.")
+            target = (root / path).resolve()
+            if not target.is_relative_to(root) or target == root or target in seen:
+                raise ValueError("Архив содержит повторяющиеся или недопустимые пути.")
+            seen.add(target)
+            if entry.flag_bits & 1:
+                raise ValueError("Архивы с паролем не поддерживаются.")
+            total += entry.file_size
+            if total > MAX_EXTRACTED_BYTES:
+                raise ValueError("Распакованный архив превышает 100 МБ.")
+            if not entry.is_dir() and path.suffix.lower() == ".session":
+                sessions.append(root / path)
+        if not sessions:
+            raise ValueError("В архиве нет файлов .session.")
+        if len(sessions) > remaining:
+            raise ValueError("Превышен лимит сессий в очереди.")
+        archive.extractall(root)
+    return sessions
+
+
 def render_progress_bar(current: int, total: int, length: int = 10) -> str:
     ratio = min(1.0, max(0.0, current / total)) if total > 0 else 0.0
     filled = int(length * ratio)
@@ -435,29 +485,33 @@ def is_admin(user_id: int) -> bool:
 def main_menu_kb(chat_id: int) -> InlineKeyboardMarkup:
     current_mode = db.get_clean_mode(chat_id, settings.default_auto_code)
     if current_mode == 1:
-        mode_label = "🔄 Миграция (Авто-код)"
+        mode_label = "Миграция · авто"
     elif current_mode == 2:
-        mode_label = "⚡ Fast Clean (без кодов)"
+        mode_label = "Быстрая очистка"
     else:
-        mode_label = "📝 Миграция (Ручной код)"
+        mode_label = "Миграция · вручную"
 
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Вход по сессии", callback_data="btn_session_login")],
+        [InlineKeyboardButton(text="Новая сессия", callback_data="btn_new_session")],
+        [InlineKeyboardButton(text=f"Режим: {mode_label}", callback_data="cycle_clean_mode")],
         [
-            InlineKeyboardButton(text=f"Режим: {mode_label}", callback_data="cycle_clean_mode"),
-            InlineKeyboardButton(text="📱 Сессия с нуля", callback_data="btn_new_session"),
+            InlineKeyboardButton(text="Статус", callback_data="queue_status"),
+            InlineKeyboardButton(text="Помощь", callback_data="show_help"),
         ],
-        [
-            InlineKeyboardButton(text="❌ Сбросить очередь", callback_data="cancel_all"),
-        ]
+        [InlineKeyboardButton(text="Сбросить очередь", callback_data="confirm_cancel")],
     ])
 
 
 def action_kb(can_skip: bool = True) -> InlineKeyboardMarkup:
     buttons = []
     if can_skip:
-        buttons.append(InlineKeyboardButton(text="⏭ Пропустить эту", callback_data="skip_current"))
-    buttons.append(InlineKeyboardButton(text="❌ Отменить всё", callback_data="cancel_all"))
-    return InlineKeyboardMarkup(inline_keyboard=[buttons])
+        buttons.append(InlineKeyboardButton(text="Пропустить", callback_data="skip_current"))
+    buttons.append(InlineKeyboardButton(text="Отменить всё", callback_data="cancel_all"))
+    return InlineKeyboardMarkup(inline_keyboard=[
+        buttons,
+        [InlineKeyboardButton(text="Меню", callback_data="main_menu")],
+    ])
 
 
 # ====================== ДЕАВТОРИЗАЦИЯ СТАРОЙ СЕССИИ ======================
@@ -752,7 +806,7 @@ async def process_fast_clean_session(item: dict, bot: Bot, state: Optional[FSMCo
 
     status = await bot.send_message(
         chat_id,
-        f"⚡ <b>[Fast Clean]</b> Проверка: <code>{item['original_name']}</code>...",
+        f"⚡ <b>[Fast Clean]</b> Проверка: <code>{html.escape(item['original_name'])}</code>...",
         reply_markup=action_kb(can_skip=True),
     )
     reporter = StatusReporter(status, interval=1.2)
@@ -777,7 +831,7 @@ async def process_fast_clean_session(item: dict, bot: Bot, state: Optional[FSMCo
 
         if not check.is_valid:
             await reporter.update(
-                f"❌ <b>Сессия отсеяна:</b> <code>{item['original_name']}</code>\n"
+                f"❌ <b>Сессия отсеяна:</b> <code>{html.escape(item['original_name'])}</code>\n"
                 f"Причина: <code>{check.error}</code> ({check.status})",
                 force=True,
             )
@@ -984,7 +1038,7 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
 
     status = await bot.send_message(
         chat_id,
-        f"⏳ Начинаю: <b>{item['original_name']}</b>\n"
+        f"⏳ Начинаю: <b>{html.escape(item['original_name'])}</b>\n"
         f"Режим перехвата: <b>{'Авто' if auto_mode else 'Вручную'}</b>\n"
         f"2FA из JSON: <b>{'Да' if item['auto_2fa'] else 'Нет'}</b>",
         reply_markup=action_kb(can_skip=True),
@@ -1016,14 +1070,14 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
         await old_client.connect()
 
         if not await old_client.is_user_authorized():
-            await reporter.update(f"❌ <b>{item['original_name']}</b>: сессия не авторизована.", force=True)
+            await reporter.update(f"❌ <b>{html.escape(item['original_name'])}</b>: сессия не авторизована.", force=True)
             await cleanup_migration(mig)
             return
 
         me = await old_client.get_me()
         phone = me.phone
         if not phone:
-            await reporter.update(f"❌ <b>{item['original_name']}</b>: нет номера.", force=True)
+            await reporter.update(f"❌ <b>{html.escape(item['original_name'])}</b>: нет номера.", force=True)
             await cleanup_migration(mig)
             return
 
@@ -1202,57 +1256,134 @@ async def queue_worker(chat_id: int, bot: Bot, state: FSMContext):
 router = Router()
 
 
+MODE_LABELS = {1: "Миграция · авто", 2: "Быстрая очистка", 0: "Миграция · вручную"}
+
+
+def menu_text(chat_id: int) -> str:
+    mode = db.get_clean_mode(chat_id, settings.default_auto_code)
+    pending = db.count_queue(chat_id)
+    return (
+        "<b>Управление сессиями</b>\n\n"
+        f"Режим: <b>{MODE_LABELS.get(mode, 'Миграция · вручную')}</b>\n"
+        f"В очереди: <b>{pending}</b>\n\n"
+        "Выберите действие. Для смены режима нажмите на его название.\n"
+        "Миграция завершает старую сессию. Очистка удаляет данные аккаунта."
+    )
+
+
+@router.callback_query(F.data == "main_menu")
+async def cb_main_menu(call: CallbackQuery):
+    await call.answer()
+    await call.message.answer(menu_text(call.message.chat.id), reply_markup=main_menu_kb(call.message.chat.id))
+
+
+@router.message(Command("status"))
+async def cmd_status(message: Message):
+    await message.answer(queue_status_text(message.chat.id), reply_markup=main_menu_kb(message.chat.id))
+
+
+def queue_status_text(chat_id: int) -> str:
+    mig = current_migration.get(chat_id)
+    if mig and mig.waiting_2fa:
+        activity = "Ожидается пароль 2FA"
+    elif mig and mig.waiting_manual_code:
+        activity = "Ожидается код подтверждения"
+    elif mig or queue_workers.get(chat_id):
+        activity = "Обработка"
+    else:
+        activity = "Нет активной миграции"
+    return f"<b>Статус</b>\n\n{activity}\nОжидают обработки: <b>{db.count_queue(chat_id)}</b>"
+
+
+@router.callback_query(F.data == "queue_status")
+async def cb_queue_status(call: CallbackQuery):
+    await call.answer()
+    await call.message.answer(queue_status_text(call.message.chat.id), reply_markup=main_menu_kb(call.message.chat.id))
+
+
+@router.callback_query(F.data == "show_help")
+async def cb_help(call: CallbackQuery):
+    await call.answer()
+    await call.message.answer(
+        "<b>Как пользоваться</b>\n\n"
+        "1. Выберите режим в меню.\n"
+        "2. Нажмите «Вход по сессии» для загрузки файла или «Новая сессия» для входа по номеру.\n"
+        "3. Следуйте сообщениям бота.\n\n"
+        "<b>Режимы</b>\n"
+        "Миграция · авто — автоматическое получение кода.\n"
+        "Миграция · вручную — код вводите вы.\n"
+        "Быстрая очистка — удаление данных без переноса сессии.\n\n"
+        "Файлы: .session или ZIP с парными JSON, до 20 МБ.\n"
+        f"Лимит очереди: {settings.max_queue_per_user} сессий.\n\n"
+        "/start — меню, /status — очередь, /cancel — отменить всё.\n"
+        "Открытие меню не прерывает обработку.\n"
+        "Миграция завершает старую сессию. Очистка удаляет данные аккаунта.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Меню", callback_data="main_menu"),
+        ]]),
+    )
+
+
+@router.callback_query(F.data == "confirm_cancel")
+async def cb_confirm_cancel(call: CallbackQuery):
+    await call.answer()
+    await call.message.answer(
+        "Сбросить очередь и остановить текущую миграцию? Уже выполненные изменения аккаунта не отменятся.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Да, сбросить", callback_data="cancel_all"),
+            InlineKeyboardButton(text="Назад", callback_data="main_menu"),
+        ]]),
+    )
+
+
 @router.message(Command("start", "help"))
 async def cmd_start(message: Message, state: FSMContext):
     chat_id = message.chat.id
-    await clear_user_queue(chat_id, state)
-
     await message.answer(
-        "⚡ <b>Session Cleaner & Migrator v100x+ Extreme Industrial</b>\n\n"
-        "Отправляйте файлы <code>.session</code> или <b>ZIP-архивы</b> (с парными JSON и прокси)!\n\n"
-        "<b>Режимы работы:</b>\n"
-        "• 🔄 <b>Миграция:</b> Перенос сессии в новую с ловлей кода и гарантированным Log Out старой\n"
-        "• ⚡ <b>Fast Clean:</b> Мгновенная проверка и тотальная очистка на месте (без кодов)\n\n"
-        "<b>Экстремальный комплекс очистки:</b>\n"
-        "• 🔒 <b>Деавторизация:</b> Старая сессия гарантированно завершается через прямой LogOutRequest\n"
-        "• 💳 <b>Платежные реквизиты:</b> Полное удаление карт и сохраненных платежей\n"
-        "• ⏳ <b>TTL аккаунта:</b> Принудительная установка 30 дней до самоуничтожения\n"
-        "• 🔍 <b>Поисковый граф:</b> Сброс топа контактов и облачного кэша подсказок\n"
-        "• 🛡 <b>Anti-Ban Fingerprints:</b> Рандомизация устройств (macOS, Win11, Linux)\n"
-        "• 🌐 <b>Proxy Pre-check:</b> Проверка прокси на доступность до подключения\n"
-        "• 🔒 <b>Privacy Lockdown:</b> Полное скрытие номера, онлайна, аватарок и звонков",
+        menu_text(chat_id),
         reply_markup=main_menu_kb(chat_id),
+    )
+
+
+@router.callback_query(F.data == "btn_session_login")
+async def cb_session_login(call: CallbackQuery):
+    await call.answer()
+    await call.message.answer(
+        "Отправьте файл <code>.session</code> или ZIP-архив с сессиями и парными JSON.\n"
+        "Файлы будут обработаны в выбранном режиме.\n"
+        "Миграция завершает старую сессию. Очистка удаляет данные аккаунта.",
+        reply_markup=main_menu_kb(call.message.chat.id),
     )
 
 
 @router.callback_query(F.data == "cycle_clean_mode")
 async def cb_cycle_clean_mode(call: CallbackQuery):
-    chat_id = call.from_user.id
+    chat_id = call.message.chat.id
     current = db.get_clean_mode(chat_id, settings.default_auto_code)
     new_mode = 2 if current == 1 else (0 if current == 2 else 1)
     db.set_clean_mode(chat_id, new_mode)
 
-    await call.message.edit_reply_markup(reply_markup=main_menu_kb(chat_id))
-    names = {1: "🔄 Миграция (Авто-код)", 2: "⚡ Быстрая очистка (Fast Clean)", 0: "📝 Миграция (Ручной код)"}
+    await call.message.edit_text(menu_text(chat_id), reply_markup=main_menu_kb(chat_id))
+    names = {1: "Миграция · авто", 2: "Быстрая очистка", 0: "Миграция · вручную"}
     await call.answer(f"Включен: {names[new_mode]}")
 
 
 @router.message(Command("fast"))
 async def cmd_fast(message: Message):
     db.set_clean_mode(message.chat.id, 2)
-    await message.answer("✅ Включен режим <b>Fast Clean</b> (моментальная проверка и очистка без кодов).", reply_markup=main_menu_kb(message.chat.id))
+    await message.answer("Режим: <b>Быстрая очистка</b>. Удаляет данные аккаунта без переноса сессии.", reply_markup=main_menu_kb(message.chat.id))
 
 
 @router.message(Command("auto"))
 async def cmd_auto(message: Message):
     db.set_clean_mode(message.chat.id, 1)
-    await message.answer("✅ Включена <b>миграция с авто-перехватом кода и выходом из старой сессии</b>.", reply_markup=main_menu_kb(message.chat.id))
+    await message.answer("Режим: <b>Миграция · авто</b>. Старая сессия будет завершена.", reply_markup=main_menu_kb(message.chat.id))
 
 
 @router.message(Command("manual"))
 async def cmd_manual(message: Message):
     db.set_clean_mode(message.chat.id, 0)
-    await message.answer("✅ Включена <b>миграция с ручным вводом кода</b>.", reply_markup=main_menu_kb(message.chat.id))
+    await message.answer("Режим: <b>Миграция · вручную</b>. Старая сессия будет завершена.", reply_markup=main_menu_kb(message.chat.id))
 
 
 @router.callback_query(F.data == "skip_current")
@@ -1359,28 +1490,35 @@ async def cmd_cancel(event: Message | CallbackQuery, state: FSMContext):
 async def process_document_upload(message: Message, state: FSMContext):
     chat_id = message.chat.id
     doc: Document = message.document
-    fname = (doc.file_name or "").lower()
-
-    if not (fname.endswith(".session") or fname.endswith(".zip")):
-        await message.answer("❌ Принимаются файлы <code>.session</code> или <b>.zip архивы</b>.")
+    try:
+        name = validate_upload_name(doc.file_name or "")
+    except ValueError as exc:
+        await message.answer(str(exc))
+        return
+    if doc.file_size and doc.file_size > MAX_UPLOAD_BYTES:
+        await message.answer("Файл превышает 20 МБ.")
+        return
+    remaining = settings.max_queue_per_user - db.count_queue(chat_id)
+    if remaining <= 0:
+        await message.answer("Очередь заполнена. Дождитесь обработки или сбросьте её.")
         return
 
     temp_dir = Path(tempfile.mkdtemp(prefix=f"upload_{chat_id}_"))
-    archive_file = temp_dir / doc.file_name
-    await message.bot.download(doc, destination=archive_file)
+    archive_file = temp_dir / name
+    try:
+        await message.bot.download(doc, destination=archive_file)
+        if archive_file.stat().st_size > MAX_UPLOAD_BYTES:
+            raise ValueError("Файл превышает 20 МБ.")
+    except Exception:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        await message.answer("Не удалось скачать файл. Проверьте размер и повторите отправку.")
+        return
 
     added_count = 0
 
-    if fname.endswith(".zip"):
+    if name.lower().endswith(".zip"):
         try:
-            with zipfile.ZipFile(archive_file, "r") as zf:
-                zf.extractall(temp_dir)
-
-            sessions = list(temp_dir.rglob("*.session"))
-            if not sessions:
-                await message.answer("❌ В архиве не обнаружено файлов <code>.session</code>.")
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                return
+            sessions = extract_session_archive(archive_file, temp_dir / "extracted", remaining)
 
             for s_path in sessions:
                 json_path = s_path.with_suffix(".json")
@@ -1405,7 +1543,7 @@ async def process_document_upload(message: Message, state: FSMContext):
                 added_count += 1
 
         except Exception as e:
-            await message.answer(f"❌ Ошибка чтения ZIP-архива: {e}")
+            await message.answer("Не удалось прочитать ZIP: " + html.escape(str(e)))
             shutil.rmtree(temp_dir, ignore_errors=True)
             return
     else:
@@ -1423,7 +1561,7 @@ async def process_document_upload(message: Message, state: FSMContext):
     total_queue = db.count_queue(chat_id)
 
     await message.answer(
-        f"📥 Сессий добавлено в SQLite: <b>{added_count}</b>\n"
+        f"Сессий добавлено: <b>{added_count}</b>\n"
         f"Всего в очереди: <b>{total_queue}</b>",
         reply_markup=action_kb(can_skip=True),
     )
@@ -1537,7 +1675,7 @@ async def cmd_stats(message: Message):
         total_in_db = cur.fetchone()[0]
 
     await message.answer(
-        f"📊 <b>Статистика сервиса v100x+ Extreme</b>\n\n"
+        f"<b>Статистика</b>\n\n"
         f"• Всего запусков: {stats['started']}\n"
         f"• Успешно очищено: {stats['success']}\n"
         f"• Пропущено оператором: {stats['skipped']}\n"
@@ -1586,17 +1724,21 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, lambda: asyncio.create_task(shutdown(dp, bot)))
-        except NotImplementedError:
-            pass
-
-    asyncio.create_task(watchdog_task(bot))
-
-    logger.info("Bot v100x+ Extreme Industrial успешно запущен")
-    await dp.start_polling(bot)
+    watchdog = asyncio.create_task(watchdog_task(bot))
+    try:
+        await bot.set_my_commands([
+            BotCommand(command="start", description="Главное меню"),
+            BotCommand(command="status", description="Статус очереди"),
+            BotCommand(command="help", description="Меню и помощь"),
+            BotCommand(command="cancel", description="Отменить обработку"),
+        ])
+        logger.info("Бот запущен")
+        await dp.start_polling(bot, close_bot_session=False)
+    finally:
+        watchdog.cancel()
+        await asyncio.gather(watchdog, return_exceptions=True)
+        await shutdown(dp, bot)
+        await dp.storage.close()
 
 
 if __name__ == "__main__":
