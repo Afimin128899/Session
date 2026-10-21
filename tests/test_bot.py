@@ -103,8 +103,51 @@ class InterfaceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_menu_actions(self):
         callbacks = {b.callback_data for row in bot.main_menu_kb(-200).inline_keyboard for b in row}
-        self.assertTrue({'btn_session_login', 'btn_new_session', 'queue_status', 'show_help', 'confirm_cancel'} <= callbacks)
+        self.assertTrue({'btn_session_login', 'btn_new_session', 'queue_status', 'show_help', 'interface_settings', 'pause_queue', 'confirm_cancel'} <= callbacks)
         self.assertNotIn('cancel_all', callbacks)
+
+    async def test_pause_resume_controls(self):
+        message = AsyncMock()
+        message.chat.id = -201
+        call = AsyncMock()
+        call.message = message
+        call.bot = AsyncMock()
+        await bot.cb_pause_queue(call)
+        call.answer.assert_awaited_once()
+        self.assertFalse(bot.queue_workers.get(-201, False))
+        self.assertFalse(bot.queue_paused.get(-201, False))
+
+        bot.db.add_queue_item('pause-me', -201, 'unused', 'unused', None, None)
+        self.addCleanup(bot.db.clear_chat_queue, -201)
+        call = AsyncMock()
+        call.message.chat.id = -201
+        call.bot = AsyncMock()
+        await bot.cb_pause_queue(call)
+        self.assertTrue(bot.queue_paused[-201])
+        self.assertIn('resume_queue', {b.callback_data for row in bot.main_menu_kb(-201).inline_keyboard for b in row})
+
+        state = AsyncMock()
+        call = AsyncMock()
+        call.message.chat.id = -201
+        call.bot = AsyncMock()
+        await bot.cb_resume_queue(call, state)
+        self.assertFalse(bot.queue_paused[-201])
+        task = bot.queue_worker_tasks.get(-201)
+        if task:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_worker_start_is_deduplicated(self):
+        hold = asyncio.Event()
+        async def fake_worker(chat_id, message_bot, state):
+            await hold.wait()
+        with patch.object(bot, 'queue_worker', side_effect=fake_worker):
+            first = bot.start_queue_worker(-202, AsyncMock(), AsyncMock())
+            second = bot.start_queue_worker(-202, AsyncMock(), AsyncMock())
+            self.assertIs(first, second)
+            first.cancel()
+            await asyncio.gather(first, return_exceptions=True)
+        bot.queue_worker_tasks.pop(-202, None)
 
     async def test_readonly_screens(self):
         for handler in (bot.cb_session_login, bot.cb_main_menu, bot.cb_help, bot.cb_queue_status, bot.cb_confirm_cancel):
@@ -150,6 +193,51 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         client.session.close.assert_awaited_once()
         dispatcher.storage.close.assert_awaited_once()
         client.set_my_commands.assert_awaited_once()
+
+
+class InterfaceSettingsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_preferences_persist_and_are_isolated(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = str(Path(root) / 'prefs.sqlite')
+            first = bot.Database(path)
+            first.set_clean_mode(10, 2)
+            self.assertFalse(first.compact_menu(10))
+            self.assertTrue(first.toggle_compact_menu(10))
+            restored = bot.Database(path)
+            self.assertTrue(restored.compact_menu(10))
+            self.assertFalse(restored.compact_menu(11))
+            restored.set_clean_mode(10, 0)
+            self.assertTrue(restored.compact_menu(10))
+            self.assertFalse(restored.toggle_compact_menu(10))
+            self.assertEqual(restored.get_clean_mode(10), 0)
+
+    async def test_compact_menu_keeps_account_warning(self):
+        with tempfile.TemporaryDirectory() as root:
+            database = bot.Database(str(Path(root) / 'prefs.sqlite'))
+            with patch.object(bot, 'db', database):
+                detailed = bot.menu_text(10)
+                database.toggle_compact_menu(10)
+                compact = bot.menu_text(10)
+                self.assertLess(len(compact), len(detailed))
+                self.assertIn('Очистка удаляет данные аккаунта', compact)
+                self.assertIn('В очереди: 0', compact)
+
+    async def test_information_commands_preserve_state(self):
+        for handler in (bot.cmd_help, bot.cmd_limits, bot.cmd_privacy, bot.cmd_interface_settings, bot.cmd_id):
+            with self.subTest(handler=handler.__name__):
+                message = AsyncMock()
+                message.chat.id = -500
+                message.from_user.id = 12345
+                with patch.object(bot.db, 'clear_chat_queue') as clear:
+                    await handler(message)
+                    clear.assert_not_called()
+                message.answer.assert_awaited_once()
+
+    async def test_limits_match_runtime_constants(self):
+        with patch.object(bot, 'MAX_UPLOAD_BYTES', 7 * 1024 * 1024), patch.object(bot, 'MAX_ARCHIVE_ENTRIES', 42):
+            text = bot.limits_text()
+        self.assertIn('до 7 МБ', text)
+        self.assertIn('до 42', text)
 
 
 if __name__ == '__main__':

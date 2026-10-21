@@ -158,6 +158,20 @@ logging.basicConfig(
 logger = logging.getLogger("IndustrialWiper")
 
 
+def public_error(exc: BaseException) -> str:
+    """Return a safe, non-sensitive error label for Telegram messages."""
+    name = type(exc).__name__
+    return html.escape(name.removesuffix("Error") or "ошибка")
+
+
+def public_archive_error(exc: BaseException) -> str:
+    if isinstance(exc, ValueError):
+        return html.escape(str(exc))
+    if isinstance(exc, zipfile.BadZipFile):
+        return "архив повреждён или имеет неверный формат"
+    return "не удалось безопасно обработать архив"
+
+
 # ====================== ПУЛ ОТПЕЧАТКОВ (ANTI-BAN) ======================
 
 FINGERPRINTS = [
@@ -198,6 +212,12 @@ class Database:
                 CREATE TABLE IF NOT EXISTS settings (
                     chat_id INTEGER PRIMARY KEY,
                     auto_mode INTEGER DEFAULT 1
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS interface_settings (
+                    chat_id INTEGER PRIMARY KEY,
+                    compact_menu INTEGER NOT NULL DEFAULT 0
                 )
             """)
             conn.commit()
@@ -258,6 +278,25 @@ class Database:
             cur.execute("SELECT auto_mode FROM settings WHERE chat_id = ?", (chat_id,))
             row = cur.fetchone()
             return int(row[0]) if row is not None else default
+
+    def compact_menu(self, chat_id: int) -> bool:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT compact_menu FROM interface_settings WHERE chat_id = ?", (chat_id,)
+            ).fetchone()
+            return bool(row[0]) if row else False
+
+    def toggle_compact_menu(self, chat_id: int) -> bool:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """INSERT INTO interface_settings (chat_id, compact_menu) VALUES (?, 1)
+                ON CONFLICT(chat_id) DO UPDATE SET compact_menu = 1 - compact_menu""",
+                (chat_id,),
+            )
+            row = conn.execute(
+                "SELECT compact_menu FROM interface_settings WHERE chat_id = ?", (chat_id,)
+            ).fetchone()
+            return bool(row[0])
 
 
 db = Database(settings.db_file)
@@ -329,6 +368,8 @@ class ActiveMigration:
 chat_semaphores: Dict[int, asyncio.Semaphore] = {}
 current_migration: Dict[int, ActiveMigration] = {}
 queue_workers: Dict[int, bool] = {}
+queue_worker_tasks: Dict[int, asyncio.Task] = {}
+queue_paused: Dict[int, bool] = {}
 
 stats = {"started": 0, "success": 0, "failed": 0, "cancelled": 0, "skipped": 0}
 
@@ -491,6 +532,11 @@ def main_menu_kb(chat_id: int) -> InlineKeyboardMarkup:
     else:
         mode_label = "Миграция · вручную"
 
+    if queue_paused.get(chat_id, False):
+        queue_button = InlineKeyboardButton(text="Продолжить очередь", callback_data="resume_queue")
+    else:
+        queue_button = InlineKeyboardButton(text="Пауза очереди", callback_data="pause_queue")
+
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Вход по сессии", callback_data="btn_session_login")],
         [InlineKeyboardButton(text="Новая сессия", callback_data="btn_new_session")],
@@ -499,6 +545,8 @@ def main_menu_kb(chat_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="Статус", callback_data="queue_status"),
             InlineKeyboardButton(text="Помощь", callback_data="show_help"),
         ],
+        [InlineKeyboardButton(text="Настройки", callback_data="interface_settings")],
+        [queue_button],
         [InlineKeyboardButton(text="Сбросить очередь", callback_data="confirm_cancel")],
     ])
 
@@ -576,6 +624,14 @@ async def cleanup_migration(mig: ActiveMigration, state: Optional[FSMContext] = 
 
 
 async def clear_user_queue(chat_id: int, state: Optional[FSMContext] = None):
+    worker_task = queue_worker_tasks.get(chat_id)
+    current_task = asyncio.current_task()
+    if worker_task and worker_task is not current_task and not worker_task.done():
+        worker_task.cancel()
+        await asyncio.gather(worker_task, return_exceptions=True)
+    queue_worker_tasks.pop(chat_id, None)
+    queue_paused[chat_id] = False
+
     if chat_id in current_migration:
         await cleanup_migration(current_migration[chat_id], state)
 
@@ -797,7 +853,7 @@ async def quick_check_session(client: TelegramClient) -> SessionCheckResult:
     except AuthKeyUnregisteredError:
         return SessionCheckResult(is_valid=False, status="KEY_REVOKED", error="Ключ авторизации отозван")
     except Exception as e:
-        return SessionCheckResult(is_valid=False, status="ERROR", error=str(e))
+        return SessionCheckResult(is_valid=False, status="ERROR", error=public_error(e))
 
 
 async def process_fast_clean_session(item: dict, bot: Bot, state: Optional[FSMContext] = None):
@@ -851,7 +907,7 @@ async def process_fast_clean_session(item: dict, bot: Bot, state: Optional[FSMCo
             clean_report.sessions_reset = True
         except Exception as e:
             clean_report.sessions_reset = False
-            clean_report.sessions_reset_warning = str(e)
+            clean_report.sessions_reset_warning = public_error(e)
 
         await reporter.update("📦 <b>[3/3] Сборка артефактов...</b>", force=True)
         metadata = await create_metadata(client, phone_label, fp)
@@ -892,7 +948,9 @@ async def process_fast_clean_session(item: dict, bot: Bot, state: Optional[FSMCo
     except Exception as e:
         logger.exception("Ошибка в fast pipeline")
         stats["failed"] += 1
-        await reporter.update(f"❌ Ошибка быстрой очистки: <code>{e}</code>", force=True)
+        await reporter.update(
+            f"❌ Ошибка быстрой очистки: <code>{public_error(e)}</code>", force=True
+        )
     finally:
         try:
             if client.is_connected():
@@ -963,7 +1021,7 @@ async def finalize(mig: ActiveMigration, message: Message, state: Optional[FSMCo
             clean_info.sessions_reset_warning = "Сессия свежая (&lt; 24 ч, лимит Telegram)"
         except Exception as e:
             clean_info.sessions_reset = False
-            clean_info.sessions_reset_warning = html.escape(str(e))
+            clean_info.sessions_reset_warning = public_error(e)
 
         metadata = await create_metadata(client, phone, mig.fingerprint)
         await client.disconnect()
@@ -1024,7 +1082,7 @@ async def finalize(mig: ActiveMigration, message: Message, state: Optional[FSMCo
     except Exception as e:
         logger.exception("Ошибка финализации")
         stats["failed"] += 1
-        await message.answer(f"❌ Ошибка миграции: <code>{html.escape(str(e))}</code>")
+        await message.answer(f"❌ Ошибка миграции: <code>{public_error(e)}</code>")
     finally:
         await cleanup_migration(mig, state)
 
@@ -1150,7 +1208,7 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
             return
 
         await reporter.update(
-            f"🔑 Код получен: <code>{code}</code>\n⏳ Вход в новую сессию...",
+            "🔑 Код подтверждения принят.\n⏳ Вход в новую сессию...",
             force=True,
             reply_markup=action_kb(can_skip=False),
         )
@@ -1186,18 +1244,20 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
             mig.last_activity = time.time()
             await state.set_state(MigrateStates.waiting_password)
             await status.edit_text(
-                f"🔑 Код <code>{code}</code> принят!\n"
+                "🔑 Код подтверждения принят.\n"
                 "🔒 Обнаружен пароль 2FA. Отправьте его следующим сообщением:",
                 reply_markup=action_kb(can_skip=True),
             )
             return
 
         except (PhoneCodeInvalidError, PhoneCodeExpiredError) as e:
-            await reporter.update(f"❌ Неверный или истекший код (<code>{code}</code>): {e}", force=True)
+            await reporter.update(
+                f"❌ Неверный или истекший код: <code>{public_error(e)}</code>", force=True
+            )
             await cleanup_migration(mig)
             return
         except Exception as e:
-            await reporter.update(f"❌ Ошибка входа: {e}", force=True)
+            await reporter.update(f"❌ Ошибка входа: <code>{public_error(e)}</code>", force=True)
             await cleanup_migration(mig)
             return
 
@@ -1209,18 +1269,34 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
         await cleanup_migration(mig)
     except Exception as e:
         logger.exception("Ошибка process_one_session")
-        await reporter.update(f"❌ Сбой обработки: {e}", force=True)
+        await reporter.update(f"❌ Сбой обработки: <code>{public_error(e)}</code>", force=True)
         await cleanup_migration(mig)
 
 
 # ====================== ВОРКЕР ОЧЕРЕДИ ======================
 
+def start_queue_worker(chat_id: int, bot: Bot, state: FSMContext) -> Optional[asyncio.Task]:
+    """Start at most one queue supervisor per chat."""
+    if queue_paused.get(chat_id, False):
+        return None
+    existing = queue_worker_tasks.get(chat_id)
+    if existing and not existing.done():
+        return existing
+    task = asyncio.create_task(queue_worker(chat_id, bot, state))
+    queue_worker_tasks[chat_id] = task
+    return task
+
+
 async def queue_worker(chat_id: int, bot: Bot, state: FSMContext):
     sem = get_chat_semaphore(chat_id)
-
-    async def _worker_task():
+    current_task = asyncio.current_task()
+    queue_workers[chat_id] = True
+    try:
         async with sem:
-            while True:
+            while not queue_paused.get(chat_id, False):
+                active = current_migration.get(chat_id)
+                if active and (active.waiting_2fa or active.waiting_manual_code):
+                    return
                 item = db.pop_next_item(chat_id)
                 if not item:
                     break
@@ -1233,10 +1309,25 @@ async def queue_worker(chat_id: int, bot: Bot, state: FSMContext):
                         pass
 
                 mode = db.get_clean_mode(chat_id, settings.default_auto_code)
-                if mode == 2:
-                    await process_fast_clean_session(item, bot, state)
-                else:
-                    await process_one_session(item, bot, state)
+                try:
+                    if mode == 2:
+                        await process_fast_clean_session(item, bot, state)
+                    else:
+                        await process_one_session(item, bot, state)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    # Keep one malformed item from wedging the whole queue.
+                    logger.exception("Необработанная ошибка элемента очереди")
+                    stats["failed"] += 1
+                    db.remove_item(item.get("id"))
+                    try:
+                        await bot.send_message(
+                            chat_id,
+                            f"❌ Сессия пропущена из-за ошибки: <code>{public_error(exc)}</code>",
+                        )
+                    except Exception:
+                        pass
 
                 mig = current_migration.get(chat_id)
                 if mig and (mig.waiting_2fa or mig.waiting_manual_code):
@@ -1244,11 +1335,12 @@ async def queue_worker(chat_id: int, bot: Bot, state: FSMContext):
 
                 await asyncio.sleep(1.0)
 
-    tasks = [_worker_task() for _ in range(settings.concurrent_workers_per_chat)]
-    await asyncio.gather(*tasks)
-
-    if db.count_queue(chat_id) == 0 and not current_migration.get(chat_id):
-        await bot.send_message(chat_id, "✅ Все потоки завершили обработку очереди!")
+        if not queue_paused.get(chat_id, False) and db.count_queue(chat_id) == 0 and not current_migration.get(chat_id):
+            await bot.send_message(chat_id, "✅ Очередь обработана")
+    finally:
+        queue_workers[chat_id] = False
+        if queue_worker_tasks.get(chat_id) is current_task:
+            queue_worker_tasks.pop(chat_id, None)
 
 
 # ====================== ХЕНДЛЕРЫ ======================
@@ -1262,6 +1354,12 @@ MODE_LABELS = {1: "Миграция · авто", 2: "Быстрая очист�
 def menu_text(chat_id: int) -> str:
     mode = db.get_clean_mode(chat_id, settings.default_auto_code)
     pending = db.count_queue(chat_id)
+    if db.compact_menu(chat_id):
+        return (
+            "<b>Меню</b>\n"
+            f"{MODE_LABELS.get(mode, 'Миграция · вручную')} · В очереди: {pending}\n"
+            "Миграция завершает старую сессию. Очистка удаляет данные аккаунта."
+        )
     return (
         "<b>Управление сессиями</b>\n\n"
         f"Режим: <b>{MODE_LABELS.get(mode, 'Миграция · вручную')}</b>\n"
@@ -1284,7 +1382,9 @@ async def cmd_status(message: Message):
 
 def queue_status_text(chat_id: int) -> str:
     mig = current_migration.get(chat_id)
-    if mig and mig.waiting_2fa:
+    if queue_paused.get(chat_id, False):
+        activity = "Очередь приостановлена"
+    elif mig and mig.waiting_2fa:
         activity = "Ожидается пароль 2FA"
     elif mig and mig.waiting_manual_code:
         activity = "Ожидается код подтверждения"
@@ -1299,6 +1399,26 @@ def queue_status_text(chat_id: int) -> str:
 async def cb_queue_status(call: CallbackQuery):
     await call.answer()
     await call.message.answer(queue_status_text(call.message.chat.id), reply_markup=main_menu_kb(call.message.chat.id))
+
+
+@router.callback_query(F.data == "pause_queue")
+async def cb_pause_queue(call: CallbackQuery):
+    chat_id = call.message.chat.id
+    if db.count_queue(chat_id) == 0 and chat_id not in current_migration:
+        await call.answer("Очередь пуста", show_alert=True)
+        return
+    queue_paused[chat_id] = True
+    await call.answer("Очередь приостановлена")
+    await call.message.edit_text(menu_text(chat_id), reply_markup=main_menu_kb(chat_id))
+
+
+@router.callback_query(F.data == "resume_queue")
+async def cb_resume_queue(call: CallbackQuery, state: FSMContext):
+    chat_id = call.message.chat.id
+    queue_paused[chat_id] = False
+    start_queue_worker(chat_id, call.bot, state)
+    await call.answer("Очередь продолжена")
+    await call.message.edit_text(menu_text(chat_id), reply_markup=main_menu_kb(chat_id))
 
 
 @router.callback_query(F.data == "show_help")
@@ -1336,7 +1456,105 @@ async def cb_confirm_cancel(call: CallbackQuery):
     )
 
 
-@router.message(Command("start", "help"))
+def interface_settings_kb(chat_id: int) -> InlineKeyboardMarkup:
+    label = "Краткий" if db.compact_menu(chat_id) else "Подробный"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"Вид меню: {label}", callback_data="toggle_compact_menu")],
+        [InlineKeyboardButton(text="О данных", callback_data="show_privacy")],
+        [InlineKeyboardButton(text="Ограничения файлов", callback_data="show_limits")],
+        [InlineKeyboardButton(text="Меню", callback_data="main_menu")],
+    ])
+
+
+def limits_text() -> str:
+    return (
+        "<b>Ограничения файлов</b>\n\n"
+        "Форматы: .session и .zip.\n"
+        f"Размер загрузки: до {MAX_UPLOAD_BYTES // (1024 * 1024)} МБ.\n"
+        f"Размер распакованного ZIP: до {MAX_EXTRACTED_BYTES // (1024 * 1024)} МБ.\n"
+        f"Файлов и папок в ZIP: до {MAX_ARCHIVE_ENTRIES}.\n"
+        f"Сессий в очереди: до {settings.max_queue_per_user}.\n"
+        "ZIP с паролем, ссылками и выходом за пределы папки не принимаются."
+    )
+
+
+PRIVACY_TEXT = (
+    "<b>О данных</b>\n\n"
+    "Файл .session даёт доступ к Telegram-аккаунту. Не передавайте чужие сессии.\n"
+    "Загруженные файлы сохраняются на сервере бота. Очередь, параметры прокси "
+    "и пароль 2FA из JSON могут храниться в локальной базе.\n"
+    "Настройки меню также сохраняются на сервере.\n\n"
+    "Не отправляйте секретные данные в общие чаты. "
+    "Сброс очереди не удаляет уже отправленные сообщения, резервные копии "
+    "и данные на стороне Telegram. Активные подключения можно проверить "
+    "в официальном Telegram: Настройки → Устройства."
+)
+
+
+@router.message(Command("settings"))
+async def cmd_interface_settings(message: Message):
+    await message.answer("<b>Настройки интерфейса</b>\nВыберите вид меню.", reply_markup=interface_settings_kb(message.chat.id))
+
+
+@router.callback_query(F.data == "interface_settings")
+async def cb_interface_settings(call: CallbackQuery):
+    await call.answer()
+    await cmd_interface_settings(call.message)
+
+
+@router.callback_query(F.data == "toggle_compact_menu")
+async def cb_toggle_compact_menu(call: CallbackQuery):
+    compact = db.toggle_compact_menu(call.message.chat.id)
+    await call.answer("Краткое меню" if compact else "Подробное меню")
+    await call.message.edit_reply_markup(reply_markup=interface_settings_kb(call.message.chat.id))
+
+
+@router.message(Command("privacy"))
+async def cmd_privacy(message: Message):
+    await message.answer(PRIVACY_TEXT, reply_markup=interface_settings_kb(message.chat.id))
+
+
+@router.callback_query(F.data == "show_privacy")
+async def cb_privacy(call: CallbackQuery):
+    await call.answer()
+    await cmd_privacy(call.message)
+
+
+@router.message(Command("limits"))
+async def cmd_limits(message: Message):
+    await message.answer(limits_text(), reply_markup=interface_settings_kb(message.chat.id))
+
+
+@router.callback_query(F.data == "show_limits")
+async def cb_limits(call: CallbackQuery):
+    await call.answer()
+    await cmd_limits(call.message)
+
+
+@router.message(Command("id"))
+async def cmd_id(message: Message):
+    user = message.from_user
+    if user:
+        await message.answer(f"Ваш Telegram ID: <code>{user.id}</code>")
+
+
+@router.message(Command("help"))
+async def cmd_help(message: Message):
+    await message.answer(
+        "<b>Команды</b>\n\n"
+        "/start — главное меню\n"
+        "/status — статус очереди\n"
+        "/settings — вид меню\n"
+        "/limits — ограничения файлов\n"
+        "/privacy — информация о данных\n"
+        "/id — ваш Telegram ID\n"
+        "/cancel — отменить обработку\n\n"
+        "Подробная справка доступна по кнопке «Помощь» в меню.",
+        reply_markup=main_menu_kb(message.chat.id),
+    )
+
+
+@router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     chat_id = message.chat.id
     await message.answer(
@@ -1400,7 +1618,7 @@ async def cb_skip_current(call: CallbackQuery, state: FSMContext):
     await cleanup_migration(mig, state)
 
     if db.count_queue(chat_id) > 0:
-        asyncio.create_task(queue_worker(chat_id, call.bot, state))
+        start_queue_worker(chat_id, call.bot, state)
 
 
 @router.message(Command("new", "create"))
@@ -1465,7 +1683,7 @@ async def process_phone(message: Message, state: FSMContext):
         await cleanup_migration(mig, state)
     except Exception as e:
         logger.exception("Ошибка запроса кода")
-        await status.edit_text(f"❌ Ошибка запроса: {e}")
+        await status.edit_text(f"❌ Ошибка запроса: <code>{public_error(e)}</code>")
         await cleanup_migration(mig, state)
 
 
@@ -1543,7 +1761,7 @@ async def process_document_upload(message: Message, state: FSMContext):
                 added_count += 1
 
         except Exception as e:
-            await message.answer("Не удалось прочитать ZIP: " + html.escape(str(e)))
+            await message.answer("Не удалось прочитать ZIP: " + public_archive_error(e))
             shutil.rmtree(temp_dir, ignore_errors=True)
             return
     else:
@@ -1566,8 +1784,7 @@ async def process_document_upload(message: Message, state: FSMContext):
         reply_markup=action_kb(can_skip=True),
     )
 
-    if not queue_workers.get(chat_id, False):
-        asyncio.create_task(queue_worker(chat_id, message.bot, state))
+    start_queue_worker(chat_id, message.bot, state)
 
 
 @router.message(MigrateStates.waiting_manual_code)
@@ -1599,7 +1816,7 @@ async def process_manual_code(message: Message, state: FSMContext):
         await finalize(mig, status, state)
 
         if db.count_queue(chat_id) > 0:
-            asyncio.create_task(queue_worker(chat_id, message.bot, state))
+            start_queue_worker(chat_id, message.bot, state)
 
     except SessionPasswordNeededError:
         if mig.auto_2fa_password:
@@ -1615,7 +1832,7 @@ async def process_manual_code(message: Message, state: FSMContext):
                 await state.clear()
                 await finalize(mig, status, state)
                 if db.count_queue(chat_id) > 0:
-                    asyncio.create_task(queue_worker(chat_id, message.bot, state))
+                    start_queue_worker(chat_id, message.bot, state)
                 return
             except Exception:
                 pass
@@ -1626,9 +1843,9 @@ async def process_manual_code(message: Message, state: FSMContext):
         await state.set_state(MigrateStates.waiting_password)
         await status.edit_text("🔒 Аккаунт защищен 2FA-паролем. Отправьте его:", reply_markup=action_kb(can_skip=True))
     except (PhoneCodeInvalidError, PhoneCodeExpiredError) as e:
-        await status.edit_text(f"❌ Неверный или истекший код: {e}")
+        await status.edit_text(f"❌ Неверный или истекший код: <code>{public_error(e)}</code>")
     except Exception as e:
-        await status.edit_text(f"❌ Сбой авторизации: {e}")
+        await status.edit_text(f"❌ Сбой авторизации: <code>{public_error(e)}</code>")
 
 
 @router.message(MigrateStates.waiting_password)
@@ -1656,12 +1873,12 @@ async def process_2fa(message: Message, state: FSMContext):
         await finalize(mig, status, state)
 
         if db.count_queue(chat_id) > 0:
-            asyncio.create_task(queue_worker(chat_id, message.bot, state))
+            start_queue_worker(chat_id, message.bot, state)
 
     except PasswordHashInvalidError:
         await status.edit_text("❌ Пароль 2FA не подходит. Попробуйте еще раз:")
     except Exception as e:
-        await status.edit_text(f"❌ Ошибка 2FA: {e}")
+        await status.edit_text(f"❌ Ошибка 2FA: <code>{public_error(e)}</code>")
         await cleanup_migration(mig, state)
 
 
@@ -1730,6 +1947,10 @@ async def main():
             BotCommand(command="start", description="Главное меню"),
             BotCommand(command="status", description="Статус очереди"),
             BotCommand(command="help", description="Меню и помощь"),
+            BotCommand(command="settings", description="Настройки интерфейса"),
+            BotCommand(command="limits", description="Ограничения файлов"),
+            BotCommand(command="privacy", description="О данных"),
+            BotCommand(command="id", description="Мой Telegram ID"),
             BotCommand(command="cancel", description="Отменить обработку"),
         ])
         logger.info("Бот запущен")
