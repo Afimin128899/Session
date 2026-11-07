@@ -1,5 +1,6 @@
 """Offline checks: never connect Telegram accounts or open bundled sessions."""
 import asyncio
+import io
 from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
@@ -15,6 +16,77 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 _runtime = tempfile.TemporaryDirectory()
 os.environ['DB_FILE'] = str(Path(_runtime.name) / 'test.sqlite')
 import bot
+
+
+class ArchiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_queue_flushes_successes_even_when_last_account_fails(self):
+        client = AsyncMock()
+        chat_id = -904
+        self.addCleanup(bot.queue_archives.pop, chat_id, None)
+        with tempfile.TemporaryDirectory() as root:
+            database = bot.Database(str(Path(root) / 'queue.sqlite'))
+            database.set_clean_mode(chat_id, 2)
+            for index in range(3):
+                database.add_queue_item(str(index), chat_id, 'unused', str(index), None, None)
+
+            async def process(item, message_bot, state):
+                if item['id'] == '2':
+                    raise ValueError('last account failed')
+                await bot.deliver_account_archive(
+                    chat_id, message_bot, b'zip', item['id'] + '.zip', 'Ready', queued=True,
+                )
+                database.remove_item(item['id'])
+
+            with patch.object(bot, 'db', database), patch.object(bot, 'process_fast_clean_session', side_effect=process), patch.object(bot.asyncio, 'sleep', new=AsyncMock()):
+                await bot.queue_worker(chat_id, client, AsyncMock())
+            self.assertEqual(database.count_outstanding(chat_id), 0)
+        client.send_document.assert_awaited_once()
+        with zipfile.ZipFile(io.BytesIO(client.send_document.call_args.kwargs['document'].data)) as archive:
+            self.assertEqual(len(archive.namelist()), 2)
+
+    async def test_three_accounts_are_sent_as_one_nested_zip(self):
+        client = AsyncMock()
+        chat_id = -901
+        self.addCleanup(bot.queue_archives.pop, chat_id, None)
+        inner = io.BytesIO()
+        with zipfile.ZipFile(inner, 'w') as archive:
+            archive.writestr('account.session', b'offline fixture')
+        for _ in range(3):
+            await bot.deliver_account_archive(
+                chat_id, client, inner.getvalue(), 'same.zip', 'Ready', queued=True,
+            )
+        client.send_document.assert_not_awaited()
+        await bot.flush_queue_archives(chat_id, client)
+        client.send_document.assert_awaited_once()
+        document = client.send_document.call_args.kwargs['document']
+        self.assertEqual(document.filename, 'accounts.zip')
+        with zipfile.ZipFile(io.BytesIO(document.data)) as bundle:
+            self.assertEqual(bundle.namelist(), ['1/same.zip', '2/same.zip', '3/same.zip'])
+            for name in bundle.namelist():
+                with zipfile.ZipFile(io.BytesIO(bundle.read(name))) as account:
+                    self.assertEqual(account.read('account.session'), b'offline fixture')
+        self.assertNotIn(chat_id, bot.queue_archives)
+        await bot.flush_queue_archives(chat_id, client)
+        client.send_document.assert_awaited_once()
+
+    async def test_send_failure_keeps_results_for_retry(self):
+        client = AsyncMock()
+        chat_id = -902
+        self.addCleanup(bot.queue_archives.pop, chat_id, None)
+        await bot.deliver_account_archive(chat_id, client, b'zip', 'one.zip', 'Ready', queued=True)
+        client.send_document.side_effect = OSError('offline')
+        with self.assertRaises(OSError):
+            await bot.flush_queue_archives(chat_id, client)
+        self.assertEqual(len(bot.queue_archives[chat_id]), 1)
+        client.send_document.side_effect = None
+        await bot.flush_queue_archives(chat_id, client)
+        self.assertNotIn(chat_id, bot.queue_archives)
+
+    async def test_individual_account_is_sent_immediately(self):
+        client = AsyncMock()
+        await bot.deliver_account_archive(-903, client, b'zip', 'one.zip', 'Ready', queued=False)
+        client.send_document.assert_awaited_once()
+        self.assertEqual(client.send_document.call_args.kwargs['document'].filename, 'one.zip')
 
 
 class UploadTests(unittest.TestCase):

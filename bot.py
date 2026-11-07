@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import io
 import json
 import logging
 import random
@@ -410,6 +411,35 @@ queue_workers: Dict[int, bool] = {}
 queue_worker_tasks: Dict[int, asyncio.Task] = {}
 queue_paused: Dict[int, bool] = {}
 queue_current_items: Dict[int, str] = {}
+queue_archives: Dict[int, List[Tuple[str, bytes]]] = {}
+
+
+async def flush_queue_archives(chat_id: int, bot: Bot):
+    archives = queue_archives.get(chat_id)
+    if not archives:
+        return
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_STORED) as bundle:
+        for index, (name, data) in enumerate(archives, 1):
+            # Separate directories also preserve repeated account filenames.
+            bundle.writestr(f"{index}/{Path(name).name}", data)
+    await bot.send_document(
+        chat_id=chat_id,
+        document=BufferedInputFile(output.getvalue(), filename="accounts.zip"),
+        caption=f"📦 Обработка завершена. Архивов аккаунтов: {len(archives)}.",
+    )
+    queue_archives.pop(chat_id, None)
+
+
+async def deliver_account_archive(chat_id: int, bot: Bot, data: bytes, filename: str,
+                                  caption: str, *, queued: bool):
+    if not queued:
+        await bot.send_document(
+            chat_id=chat_id, document=BufferedInputFile(data, filename=filename), caption=caption,
+        )
+        return
+    queue_archives.setdefault(chat_id, []).append((filename, data))
+    await bot.send_message(chat_id, caption)
 
 stats = {"started": 0, "success": 0, "failed": 0, "cancelled": 0, "skipped": 0}
 
@@ -677,8 +707,11 @@ async def cleanup_migration(mig: ActiveMigration, state: Optional[FSMContext] = 
     if state and (mig.waiting_2fa or mig.waiting_manual_code):
         await state.clear()
 
+    if mig.status_message and db.count_outstanding(chat_id) == 0:
+        await flush_queue_archives(chat_id, mig.status_message.bot)
 
-async def clear_user_queue(chat_id: int, state: Optional[FSMContext] = None):
+
+async def clear_user_queue(chat_id: int, state: Optional[FSMContext] = None, bot: Optional[Bot] = None):
     worker_task = queue_worker_tasks.get(chat_id)
     current_task = asyncio.current_task()
     if worker_task and worker_task is not current_task and not worker_task.done():
@@ -704,6 +737,8 @@ async def clear_user_queue(chat_id: int, state: Optional[FSMContext] = None):
     queue_workers[chat_id] = False
     if state:
         await state.clear()
+    if bot:
+        await flush_queue_archives(chat_id, bot)
 
 
 # ====================== ЭКСТРЕМАЛЬНАЯ ОЧИСТКА ======================
@@ -993,10 +1028,9 @@ async def process_fast_clean_session(item: dict, bot: Bot, state: Optional[FSMCo
             f"🌐 Сессии: <b>{'Сброшены' if clean_report.sessions_reset else 'Пропущены (&lt; 24ч)'}</b>"
         )
 
-        await bot.send_document(
-            chat_id=chat_id,
-            document=BufferedInputFile(zip_path.read_bytes(), filename=f"{phone_label}_cleaned.zip"),
-            caption=caption,
+        await deliver_account_archive(
+            chat_id, bot, zip_path.read_bytes(), f"{phone_label}_cleaned.zip", caption,
+            queued=bool(item.get("id")),
         )
         stats["success"] += 1
 
@@ -1016,6 +1050,8 @@ async def process_fast_clean_session(item: dict, bot: Bot, state: Optional[FSMCo
             shutil.rmtree(temp_dir, ignore_errors=True)
         if item.get("id"):
             db.remove_item(item["id"])
+        if db.count_outstanding(chat_id) == 0:
+            await flush_queue_archives(chat_id, bot)
 
 
 # ====================== ФИНАЛИЗАЦИЯ И МЕТАДАННЫЕ ======================
@@ -1119,9 +1155,9 @@ async def finalize(mig: ActiveMigration, message: Message, state: Optional[FSMCo
             f"{ttl_line}"
         )
 
-        await message.answer_document(
-            BufferedInputFile(data, filename=f"{phone}_v100x.zip"),
-            caption=caption,
+        await deliver_account_archive(
+            mig.chat_id, message.bot, data, f"{phone}_v100x.zip", caption,
+            queued=bool(mig.queue_db_id),
         )
         stats["success"] += 1
 
@@ -1131,6 +1167,8 @@ async def finalize(mig: ActiveMigration, message: Message, state: Optional[FSMCo
         await message.answer(f"❌ Ошибка миграции: <code>{public_error(e)}</code>")
     finally:
         await cleanup_migration(mig, state)
+        if db.count_outstanding(mig.chat_id) == 0:
+            await flush_queue_archives(mig.chat_id, message.bot)
 
 
 # ====================== ОБРАБОТЧИК МИГРАЦИИ ======================
@@ -1385,6 +1423,7 @@ async def queue_worker(chat_id: int, bot: Bot, state: FSMContext):
                 await asyncio.sleep(1.0)
 
         if not queue_paused.get(chat_id, False) and db.count_queue(chat_id) == 0 and not current_migration.get(chat_id):
+            await flush_queue_archives(chat_id, bot)
             await bot.send_message(chat_id, "✅ Очередь обработана")
     finally:
         queue_workers[chat_id] = False
@@ -1839,7 +1878,7 @@ async def cb_request_login_code(call: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "cancel_all")
 async def cmd_cancel(event: Message | CallbackQuery, state: FSMContext):
     chat_id = event.from_user.id if isinstance(event, CallbackQuery) else event.chat.id
-    await clear_user_queue(chat_id, state)
+    await clear_user_queue(chat_id, state, event.bot)
     stats["cancelled"] += 1
 
     text = "🛑 Очередь полностью сброшена, временные файлы удалены."
