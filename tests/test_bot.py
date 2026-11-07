@@ -67,7 +67,7 @@ class ArchiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
         document = client.send_document.call_args.kwargs['document']
         self.assertEqual(document.filename, 'accounts.zip')
         with zipfile.ZipFile(io.BytesIO(document.data)) as bundle:
-            self.assertEqual(bundle.namelist(), ['1/same.zip', '2/same.zip', '3/same.zip'])
+            self.assertEqual(bundle.namelist(), ['same.zip', 'same_2.zip', 'same_3.zip'])
             for name in bundle.namelist():
                 with zipfile.ZipFile(io.BytesIO(bundle.read(name))) as account:
                     self.assertEqual(account.read('account.session'), b'offline fixture')

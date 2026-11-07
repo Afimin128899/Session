@@ -451,11 +451,19 @@ async def flush_queue_archives(chat_id: int, bot: Bot, *, include_sent: bool = F
         while archives:
             output = io.BytesIO()
             batch = []
+            used_names = set()
             with zipfile.ZipFile(output, "w", zipfile.ZIP_STORED) as bundle:
                 for archive_id, name, data in archives[:3]:
                     if batch and output.tell() + len(data) + 4096 > MAX_RESULT_BYTES:
                         break
-                    bundle.writestr(f"{len(batch) + 1}/{Path(name).name}", data)
+                    filename = Path(name).name
+                    unique_name = filename
+                    suffix = 2
+                    while unique_name.casefold() in used_names:
+                        unique_name = f"{Path(filename).stem}_{suffix}{Path(filename).suffix}"
+                        suffix += 1
+                    used_names.add(unique_name.casefold())
+                    bundle.writestr(unique_name, data)
                     batch.append(archive_id)
             await bot.send_document(
                 chat_id=chat_id,
