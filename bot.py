@@ -227,7 +227,36 @@ class Database:
                     max_sessions INTEGER NOT NULL CHECK (max_sessions > 0)
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS result_archives (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    filename TEXT NOT NULL,
+                    data BLOB NOT NULL,
+                    delivered INTEGER NOT NULL DEFAULT 0
+                )
+            """)
             conn.commit()
+
+    def save_archive(self, chat_id: int, filename: str, data: bytes):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                "INSERT INTO result_archives (chat_id, filename, data) VALUES (?, ?, ?)",
+                (chat_id, Path(filename).name, data),
+            )
+            return cursor.lastrowid
+
+    def archives(self, chat_id: int, include_sent: bool = False):
+        with sqlite3.connect(self.db_path) as conn:
+            return conn.execute(
+                "SELECT id, filename, data FROM result_archives WHERE chat_id = ? "
+                + ("" if include_sent else "AND delivered = 0 ") + "ORDER BY id",
+                (chat_id,),
+            ).fetchall()
+
+    def mark_archives_delivered(self, ids):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.executemany("UPDATE result_archives SET delivered = 1 WHERE id = ?", [(i,) for i in ids])
 
     def add_queue_item(self, item_id: str, chat_id: int, file_path: str, original_name: str, auto_2fa: Optional[str], proxy_dict: Optional[dict]):
         self.add_queue_items(chat_id, [(item_id, file_path, original_name, auto_2fa, proxy_dict)])
@@ -411,35 +440,59 @@ queue_workers: Dict[int, bool] = {}
 queue_worker_tasks: Dict[int, asyncio.Task] = {}
 queue_paused: Dict[int, bool] = {}
 queue_current_items: Dict[int, str] = {}
-queue_archives: Dict[int, List[Tuple[str, bytes]]] = {}
+archive_locks: Dict[int, asyncio.Lock] = {}
+MAX_RESULT_BYTES = 45 * 1024 * 1024
 
 
-async def flush_queue_archives(chat_id: int, bot: Bot):
-    archives = queue_archives.get(chat_id)
-    if not archives:
-        return
-    output = io.BytesIO()
-    with zipfile.ZipFile(output, "w", zipfile.ZIP_STORED) as bundle:
-        for index, (name, data) in enumerate(archives, 1):
-            # Separate directories also preserve repeated account filenames.
-            bundle.writestr(f"{index}/{Path(name).name}", data)
-    await bot.send_document(
-        chat_id=chat_id,
-        document=BufferedInputFile(output.getvalue(), filename="accounts.zip"),
-        caption=f"📦 Обработка завершена. Архивов аккаунтов: {len(archives)}.",
-    )
-    queue_archives.pop(chat_id, None)
+async def flush_queue_archives(chat_id: int, bot: Bot, *, include_sent: bool = False):
+    # Keep successful results on disk even after delivery, for /archives recovery.
+    async with archive_locks.setdefault(chat_id, asyncio.Lock()):
+        archives = db.archives(chat_id, include_sent)
+        while archives:
+            output = io.BytesIO()
+            batch = []
+            with zipfile.ZipFile(output, "w", zipfile.ZIP_STORED) as bundle:
+                for archive_id, name, data in archives[:3]:
+                    if batch and output.tell() + len(data) + 4096 > MAX_RESULT_BYTES:
+                        break
+                    bundle.writestr(f"{len(batch) + 1}/{Path(name).name}", data)
+                    batch.append(archive_id)
+            await bot.send_document(
+                chat_id=chat_id,
+                document=BufferedInputFile(output.getvalue(), filename="accounts.zip"),
+                caption=f"📦 Архивов аккаунтов: {len(batch)}. Копии сохранены: /archives.",
+            )
+            db.mark_archives_delivered(batch)
+            archives = archives[len(batch):]
+
+
+async def try_flush_queue_archives(chat_id: int, bot: Bot, *, include_sent: bool = False):
+    try:
+        await flush_queue_archives(chat_id, bot, include_sent=include_sent)
+    except Exception:
+        logger.exception("Не удалось отправить сохранённые архивы")
+        try:
+            await bot.send_message(chat_id, "❌ Не удалось отправить ZIP. Результаты сохранены на диске. Повторите отправку: /archives.")
+        except Exception:
+            logger.exception("Не удалось сообщить об ошибке доставки")
 
 
 async def deliver_account_archive(chat_id: int, bot: Bot, data: bytes, filename: str,
                                   caption: str, *, queued: bool):
+    # Commit before any network request and before the pipeline removes temp files.
+    archive_id = db.save_archive(chat_id, filename, data)
+    try:
+        await bot.send_message(chat_id, caption)
+    except Exception:
+        logger.exception("Не удалось отправить отчёт; ZIP сохранён")
     if not queued:
-        await bot.send_document(
-            chat_id=chat_id, document=BufferedInputFile(data, filename=filename), caption=caption,
-        )
-        return
-    queue_archives.setdefault(chat_id, []).append((filename, data))
-    await bot.send_message(chat_id, caption)
+        try:
+            await bot.send_document(chat_id=chat_id, document=BufferedInputFile(data, filename=filename), caption=caption)
+            db.mark_archives_delivered([archive_id])
+        except Exception:
+            await try_flush_queue_archives(chat_id, bot)
+    elif len(db.archives(chat_id)) >= 3:
+        await try_flush_queue_archives(chat_id, bot)
 
 stats = {"started": 0, "success": 0, "failed": 0, "cancelled": 0, "skipped": 0}
 
@@ -708,7 +761,7 @@ async def cleanup_migration(mig: ActiveMigration, state: Optional[FSMContext] = 
         await state.clear()
 
     if mig.status_message and db.count_outstanding(chat_id) == 0:
-        await flush_queue_archives(chat_id, mig.status_message.bot)
+        await try_flush_queue_archives(chat_id, mig.status_message.bot)
 
 
 async def clear_user_queue(chat_id: int, state: Optional[FSMContext] = None, bot: Optional[Bot] = None):
@@ -738,7 +791,7 @@ async def clear_user_queue(chat_id: int, state: Optional[FSMContext] = None, bot
     if state:
         await state.clear()
     if bot:
-        await flush_queue_archives(chat_id, bot)
+        await try_flush_queue_archives(chat_id, bot)
 
 
 # ====================== ЭКСТРЕМАЛЬНАЯ ОЧИСТКА ======================
@@ -949,6 +1002,7 @@ async def quick_check_session(client: TelegramClient) -> SessionCheckResult:
 async def process_fast_clean_session(item: dict, bot: Bot, state: Optional[FSMContext] = None):
     chat_id = item["chat_id"]
     mig_id = str(uuid.uuid4())[:8]
+    archive_saved = False
 
     status = await bot.send_message(
         chat_id,
@@ -1032,6 +1086,7 @@ async def process_fast_clean_session(item: dict, bot: Bot, state: Optional[FSMCo
             chat_id, bot, zip_path.read_bytes(), f"{phone_label}_cleaned.zip", caption,
             queued=bool(item.get("id")),
         )
+        archive_saved = True
         stats["success"] += 1
 
     except Exception as e:
@@ -1046,12 +1101,12 @@ async def process_fast_clean_session(item: dict, bot: Bot, state: Optional[FSMCo
                 await client.disconnect()
         except Exception:
             pass
-        if temp_dir.exists():
+        if temp_dir.exists() and (archive_saved or not list(temp_dir.glob("*.zip"))):
             shutil.rmtree(temp_dir, ignore_errors=True)
         if item.get("id"):
             db.remove_item(item["id"])
         if db.count_outstanding(chat_id) == 0:
-            await flush_queue_archives(chat_id, bot)
+            await try_flush_queue_archives(chat_id, bot)
 
 
 # ====================== ФИНАЛИЗАЦИЯ И МЕТАДАННЫЕ ======================
@@ -1088,6 +1143,7 @@ async def finalize(mig: ActiveMigration, message: Message, state: Optional[FSMCo
     phone = mig.phone
     temp_dir = mig.temp_dir
     reporter = StatusReporter(mig.status_message or message)
+    archive_saved = False
 
     try:
         if not client or not await client.is_user_authorized():
@@ -1159,6 +1215,7 @@ async def finalize(mig: ActiveMigration, message: Message, state: Optional[FSMCo
             mig.chat_id, message.bot, data, f"{phone}_v100x.zip", caption,
             queued=bool(mig.queue_db_id),
         )
+        archive_saved = True
         stats["success"] += 1
 
     except Exception as e:
@@ -1166,9 +1223,13 @@ async def finalize(mig: ActiveMigration, message: Message, state: Optional[FSMCo
         stats["failed"] += 1
         await message.answer(f"❌ Ошибка миграции: <code>{public_error(e)}</code>")
     finally:
+        if not archive_saved and temp_dir and list(temp_dir.glob("*.zip")):
+            # Preserve the only copy if saving to SQLite failed (e.g. disk full).
+            logger.error("Архив не записан в БД; временный каталог сохранён")
+            mig.temp_dir = None
         await cleanup_migration(mig, state)
         if db.count_outstanding(mig.chat_id) == 0:
-            await flush_queue_archives(mig.chat_id, message.bot)
+            await try_flush_queue_archives(mig.chat_id, message.bot)
 
 
 # ====================== ОБРАБОТЧИК МИГРАЦИИ ======================
@@ -1423,7 +1484,7 @@ async def queue_worker(chat_id: int, bot: Bot, state: FSMContext):
                 await asyncio.sleep(1.0)
 
         if not queue_paused.get(chat_id, False) and db.count_queue(chat_id) == 0 and not current_migration.get(chat_id):
-            await flush_queue_archives(chat_id, bot)
+            await try_flush_queue_archives(chat_id, bot)
             await bot.send_message(chat_id, "✅ Очередь обработана")
     finally:
         queue_workers[chat_id] = False
@@ -1435,6 +1496,14 @@ async def queue_worker(chat_id: int, bot: Bot, state: FSMContext):
 # ====================== ХЕНДЛЕРЫ ======================
 
 router = Router()
+
+
+@router.message(Command("archives"))
+async def cmd_archives(message: Message):
+    if not db.archives(message.chat.id, include_sent=True):
+        await message.answer("Сохранённых архивов для этого чата нет.")
+        return
+    await try_flush_queue_archives(message.chat.id, message.bot, include_sent=True)
 
 
 MODE_LABELS = {1: "Миграция · авто", 2: "Быстрая очистка", 0: "Миграция · вручную"}
@@ -2130,6 +2199,7 @@ async def main():
         await bot.set_my_commands([
             BotCommand(command="start", description="Главное меню"),
             BotCommand(command="status", description="Статус очереди"),
+            BotCommand(command="archives", description="Получить сохранённые архивы"),
             BotCommand(command="pause", description="Пауза очереди"),
             BotCommand(command="resume", description="Продолжить очередь"),
             BotCommand(command="help", description="Меню и помощь"),

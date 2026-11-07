@@ -19,10 +19,17 @@ import bot
 
 
 class ArchiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.database = bot.Database(str(Path(self.tmp.name) / 'results.sqlite'))
+        patcher = patch.object(bot, 'db', self.database)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     async def test_queue_flushes_successes_even_when_last_account_fails(self):
         client = AsyncMock()
         chat_id = -904
-        self.addCleanup(bot.queue_archives.pop, chat_id, None)
         with tempfile.TemporaryDirectory() as root:
             database = bot.Database(str(Path(root) / 'queue.sqlite'))
             database.set_clean_mode(chat_id, 2)
@@ -47,7 +54,6 @@ class ArchiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_three_accounts_are_sent_as_one_nested_zip(self):
         client = AsyncMock()
         chat_id = -901
-        self.addCleanup(bot.queue_archives.pop, chat_id, None)
         inner = io.BytesIO()
         with zipfile.ZipFile(inner, 'w') as archive:
             archive.writestr('account.session', b'offline fixture')
@@ -55,7 +61,7 @@ class ArchiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
             await bot.deliver_account_archive(
                 chat_id, client, inner.getvalue(), 'same.zip', 'Ready', queued=True,
             )
-        client.send_document.assert_not_awaited()
+        # Third result triggers delivery without waiting for the rest of the queue.
         await bot.flush_queue_archives(chat_id, client)
         client.send_document.assert_awaited_once()
         document = client.send_document.call_args.kwargs['document']
@@ -65,22 +71,67 @@ class ArchiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
             for name in bundle.namelist():
                 with zipfile.ZipFile(io.BytesIO(bundle.read(name))) as account:
                     self.assertEqual(account.read('account.session'), b'offline fixture')
-        self.assertNotIn(chat_id, bot.queue_archives)
+        self.assertEqual(self.database.archives(chat_id), [])
         await bot.flush_queue_archives(chat_id, client)
         client.send_document.assert_awaited_once()
 
     async def test_send_failure_keeps_results_for_retry(self):
         client = AsyncMock()
         chat_id = -902
-        self.addCleanup(bot.queue_archives.pop, chat_id, None)
         await bot.deliver_account_archive(chat_id, client, b'zip', 'one.zip', 'Ready', queued=True)
         client.send_document.side_effect = OSError('offline')
         with self.assertRaises(OSError):
             await bot.flush_queue_archives(chat_id, client)
-        self.assertEqual(len(bot.queue_archives[chat_id]), 1)
+        self.assertEqual(len(self.database.archives(chat_id)), 1)
         client.send_document.side_effect = None
         await bot.flush_queue_archives(chat_id, client)
-        self.assertNotIn(chat_id, bot.queue_archives)
+        self.assertEqual(self.database.archives(chat_id), [])
+
+    async def test_nine_accounts_send_three_batches_before_queue_finishes(self):
+        client = AsyncMock()
+        for index in range(9):
+            await bot.deliver_account_archive(-908, client, b'zip', f'{index}.zip', 'Ready', queued=True)
+            self.assertEqual(client.send_document.await_count, (index + 1) // 3)
+        self.assertEqual(self.database.archives(-908), [])
+        self.assertEqual(len(self.database.archives(-908, include_sent=True)), 9)
+
+    async def test_automatic_delivery_failure_preserves_all_three(self):
+        client = AsyncMock()
+        client.send_document.side_effect = OSError('offline')
+        for index in range(3):
+            await bot.deliver_account_archive(-909, client, b'zip', f'{index}.zip', 'Ready', queued=True)
+        self.assertEqual(len(self.database.archives(-909)), 3)
+        self.assertIn('/archives', client.send_message.call_args.args[1])
+        restored = bot.Database(self.database.db_path)
+        client.send_document.side_effect = None
+        with patch.object(bot, 'db', restored):
+            await bot.flush_queue_archives(-909, client)
+        self.assertEqual(restored.archives(-909), [])
+
+    async def test_restart_and_recovery_after_delivery(self):
+        client = AsyncMock()
+        await bot.deliver_account_archive(-905, client, b'account zip', 'one.zip', 'Ready', queued=True)
+        restored = bot.Database(self.database.db_path)
+        with patch.object(bot, 'db', restored):
+            await bot.flush_queue_archives(-905, client)
+            self.assertEqual(restored.archives(-905), [])
+            self.assertEqual(len(restored.archives(-905, include_sent=True)), 1)
+            await bot.flush_queue_archives(-905, client, include_sent=True)
+        self.assertEqual(client.send_document.await_count, 2)
+
+    async def test_caption_failure_does_not_lose_archive(self):
+        client = AsyncMock()
+        client.send_message.side_effect = OSError('offline')
+        await bot.deliver_account_archive(-906, client, b'zip', 'one.zip', 'Ready', queued=True)
+        self.assertEqual(len(self.database.archives(-906)), 1)
+        await bot.flush_queue_archives(-906, client)
+        client.send_document.assert_awaited_once()
+
+    async def test_concurrent_flush_does_not_duplicate_delivery(self):
+        client = AsyncMock()
+        await bot.deliver_account_archive(-907, client, b'zip', 'one.zip', 'Ready', queued=True)
+        await asyncio.gather(bot.flush_queue_archives(-907, client), bot.flush_queue_archives(-907, client))
+        client.send_document.assert_awaited_once()
 
     async def test_individual_account_is_sent_immediately(self):
         client = AsyncMock()
