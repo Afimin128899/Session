@@ -454,21 +454,30 @@ async def flush_queue_archives(chat_id: int, bot: Bot, *, include_sent: bool = F
             used_names = set()
             with zipfile.ZipFile(output, "w", zipfile.ZIP_STORED) as bundle:
                 for archive_id, name, data in archives[:3]:
-                    if batch and output.tell() + len(data) + 4096 > MAX_RESULT_BYTES:
-                        break
-                    filename = Path(name).name
-                    unique_name = filename
-                    suffix = 2
-                    while unique_name.casefold() in used_names:
-                        unique_name = f"{Path(filename).stem}_{suffix}{Path(filename).suffix}"
-                        suffix += 1
-                    used_names.add(unique_name.casefold())
-                    bundle.writestr(unique_name, data)
+                    with zipfile.ZipFile(io.BytesIO(data)) as account:
+                        members = [entry for entry in account.infolist()
+                                   if not entry.is_dir() and Path(entry.filename).suffix.lower() in {".session", ".json"}]
+                        if not members:
+                            raise ValueError("В архиве аккаунта нет файлов .session или .json")
+                        expanded_size = sum(entry.file_size for entry in members)
+                        if batch and output.tell() + expanded_size + 4096 > MAX_RESULT_BYTES:
+                            break
+                        # Use one suffix for the whole account to keep session/JSON pairs together.
+                        suffix = 1
+                        while True:
+                            names = [f"{Path(entry.filename).stem}{'_' + str(suffix) if suffix > 1 else ''}{Path(entry.filename).suffix}"
+                                     for entry in members]
+                            if not any(filename.casefold() in used_names for filename in names):
+                                break
+                            suffix += 1
+                        for entry, filename in zip(members, names):
+                            bundle.writestr(filename, account.read(entry))
+                            used_names.add(filename.casefold())
                     batch.append(archive_id)
             await bot.send_document(
                 chat_id=chat_id,
                 document=BufferedInputFile(output.getvalue(), filename="accounts.zip"),
-                caption=f"📦 Архивов аккаунтов: {len(batch)}. Копии сохранены: /archives.",
+                caption=f"📦 Аккаунтов в архиве: {len(batch)}. Копии сохранены: /archives.",
             )
             db.mark_archives_delivered(batch)
             archives = archives[len(batch):]
