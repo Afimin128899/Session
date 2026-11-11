@@ -8,7 +8,7 @@ import stat
 import sys
 import tempfile
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 import zipfile
 
 sys.dont_write_bytecode = True
@@ -16,6 +16,133 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 _runtime = tempfile.TemporaryDirectory()
 os.environ['DB_FILE'] = str(Path(_runtime.name) / 'test.sqlite')
 import bot
+
+
+class ParallelDialogCleanupTests(unittest.IsolatedAsyncioTestCase):
+    def entity(self, kind, key, **flags):
+        entity = MagicMock(spec=kind)
+        entity.id = key
+        entity.creator = False
+        entity.is_self = False
+        entity.bot = False
+        for name, value in flags.items():
+            setattr(entity, name, value)
+        return entity
+
+    def client(self, entities):
+        client = AsyncMock()
+
+        async def dialogs():
+            for entity in entities:
+                dialog = MagicMock()
+                dialog.entity = entity
+                yield dialog
+
+        client.iter_dialogs = dialogs
+        return client
+
+    async def test_one_hundred_channels_use_fifty_concurrent_requests(self):
+        client = self.client([self.entity(bot.Channel, i) for i in range(100)])
+        ready = asyncio.Event()
+        release = asyncio.Event()
+        active = 0
+        peak = 0
+
+        async def request(value, **kwargs):
+            nonlocal active, peak
+            self.assertIsInstance(value, bot.LeaveChannelRequest)
+            self.assertEqual(kwargs['flood_sleep_threshold'], 0)
+            active += 1
+            peak = max(peak, active)
+            if active == 50:
+                ready.set()
+            try:
+                await release.wait()
+            finally:
+                active -= 1
+
+        client.side_effect = request
+        report = bot.CleanReport()
+        with patch.object(bot.settings, 'concurrent_dialogs_per_session', 50):
+            task = asyncio.create_task(bot.clean_account_dialogs(client, AsyncMock(), report))
+            try:
+                await asyncio.wait_for(ready.wait(), 2)
+                self.assertEqual(client.await_count, 50)
+                release.set()
+                await asyncio.wait_for(task, 2)
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual(peak, 50)
+        self.assertEqual(report.dialogs_purged, 100)
+        self.assertEqual(report.dialogs_failed, 0)
+
+    async def test_all_dialog_types_and_failures_are_counted(self):
+        entities = [self.entity(bot.Channel, 1, creator=True), self.entity(bot.Channel, 2),
+                    self.entity(bot.Chat, 3), self.entity(bot.User, 4, bot=True),
+                    self.entity(bot.User, 5), self.entity(bot.User, 6, is_self=True)]
+        client = self.client(entities)
+
+        async def request(value, **kwargs):
+            if isinstance(value, bot.DeleteChatUserRequest):
+                raise ValueError('cannot leave group')
+            if isinstance(value, bot.DeleteHistoryRequest):
+                raise ValueError('use fallback')
+
+        client.side_effect = request
+        report = bot.CleanReport()
+        await bot.clean_account_dialogs(client, AsyncMock(), report)
+        self.assertEqual(report.dialogs_purged, 4)
+        self.assertEqual(report.dialogs_failed, 1)
+        self.assertEqual(report.channels_deleted, 1)
+        self.assertEqual(client.delete_dialog.await_count, 2)
+        self.assertTrue(any(isinstance(call.args[0], bot.BlockRequest) for call in client.await_args_list))
+
+    async def test_flood_wait_retries_same_channel_and_delays_following_requests(self):
+        client = self.client([self.entity(bot.Channel, 1, creator=True), self.entity(bot.Channel, 2)])
+        times = []
+        loop = asyncio.get_running_loop()
+
+        async def request(value, **kwargs):
+            times.append(loop.time())
+            if len(times) == 1:
+                raise bot.FloodWaitError(request=value, capture=0)
+
+        client.side_effect = request
+        report = bot.CleanReport()
+        await asyncio.wait_for(bot.clean_account_dialogs(client, AsyncMock(), report), 3)
+        self.assertEqual(client.await_count, 3)
+        self.assertEqual(report.channels_deleted, 1)
+        self.assertEqual(sum(isinstance(call.args[0], bot.LeaveChannelRequest)
+                             for call in client.await_args_list), 1)
+        self.assertGreaterEqual(times[1] - times[0], 1)
+        self.assertEqual(report.dialogs_purged, 2)
+        self.assertEqual(report.dialogs_failed, 0)
+
+    async def test_cancellation_stops_all_pending_requests(self):
+        client = self.client([self.entity(bot.Channel, i) for i in range(100)])
+        active = 0
+        ready = asyncio.Event()
+
+        async def request(value, **kwargs):
+            nonlocal active
+            active += 1
+            if active == 50:
+                ready.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                active -= 1
+
+        client.side_effect = request
+        task = asyncio.create_task(bot.clean_account_dialogs(client, AsyncMock(), bot.CleanReport()))
+        try:
+            await asyncio.wait_for(ready.wait(), 2)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual(active, 0)
+        self.assertEqual(client.await_count, 50)
 
 
 class ArchiveDeliveryTests(unittest.IsolatedAsyncioTestCase):

@@ -115,6 +115,7 @@ class Settings(BaseSettings):
     max_queue_per_user: int = Field(default=150, ge=1, le=10000)
     default_auto_code: int = 1
     concurrent_workers_per_chat: int = Field(default=3, ge=1, le=16)
+    concurrent_dialogs_per_session: int = Field(default=50, ge=1, le=100)
     db_file: str = "sessions_v100x.db"
 
     proxy_protocol: Optional[str] = None
@@ -400,6 +401,7 @@ class CleanReport:
     stickers_removed: int = 0
     channels_deleted: int = 0
     dialogs_purged: int = 0
+    dialogs_failed: int = 0
     saved_messages_cleared: bool = False
     privacy_secured: bool = False
     payments_cleared: bool = False
@@ -813,6 +815,91 @@ async def clear_user_queue(chat_id: int, state: Optional[FSMContext] = None, bot
 
 # ====================== ЭКСТРЕМАЛЬНАЯ ОЧИСТКА ======================
 
+async def clean_account_dialogs(client: TelegramClient, reporter: StatusReporter, report: CleanReport):
+    """Clean a bounded number of dialogs concurrently, respecting account FloodWaits."""
+    pending: Set[asyncio.Task] = set()
+    blocked_until = 0.0
+    loop = asyncio.get_running_loop()
+
+    async def wait_for_account():
+        while blocked_until > loop.time():
+            await asyncio.sleep(blocked_until - loop.time())
+
+    async def request(value):
+        await wait_for_account()
+        # Surface FloodWait to the shared account gate instead of sleeping per task.
+        return await client(value, flood_sleep_threshold=0)
+
+    async def clean_dialog(entity):
+        nonlocal blocked_until
+        if isinstance(entity, User) and getattr(entity, "is_self", False):
+            return
+        if not isinstance(entity, (Channel, Chat, User)):
+            return
+        for attempt in range(3):
+            try:
+                if isinstance(entity, Channel):
+                    if getattr(entity, "creator", False):
+                        try:
+                            await request(DeleteChannelRequest(channel=entity))
+                            report.channels_deleted += 1
+                        except FloodWaitError:
+                            raise
+                        except Exception:
+                            await request(LeaveChannelRequest(entity))
+                    else:
+                        await request(LeaveChannelRequest(entity))
+                elif isinstance(entity, Chat):
+                    await request(DeleteChatUserRequest(chat_id=entity.id, user_id="me"))
+                else:
+                    if getattr(entity, "bot", False):
+                        try:
+                            await request(BlockRequest(id=entity))
+                        except FloodWaitError:
+                            raise
+                        except Exception:
+                            pass
+                    try:
+                        await request(DeleteHistoryRequest(peer=entity, max_id=0, just_clear=False, revoke=True))
+                    except FloodWaitError:
+                        raise
+                    except Exception:
+                        await wait_for_account()
+                        await client.delete_dialog(entity)
+                report.dialogs_purged += 1
+                if report.dialogs_purged % 10 == 0:
+                    await reporter.update(
+                        f"🧹 Очищено диалогов: <b>{report.dialogs_purged}</b>\n"
+                        f"{render_progress_bar(8, 10)}"
+                    )
+                return
+            except FloodWaitError as exc:
+                blocked_until = max(blocked_until, loop.time() + exc.seconds + 1)
+                await reporter.update(f"⏳ FloodWait: ожидание {exc.seconds} с...", force=True)
+                if attempt < 2:
+                    continue
+            except Exception:
+                logger.warning("Не удалось очистить диалог %s", entity.id, exc_info=True)
+                break
+        report.dialogs_failed += 1
+
+    try:
+        async for dialog in client.iter_dialogs():
+            await wait_for_account()
+            pending.add(asyncio.create_task(clean_dialog(dialog.entity)))
+            if len(pending) >= settings.concurrent_dialogs_per_session:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    task.result()
+        if pending:
+            await asyncio.gather(*pending)
+    finally:
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+
 async def deep_clean_account(client: TelegramClient, reporter: StatusReporter) -> CleanReport:
     report = CleanReport()
 
@@ -926,52 +1013,7 @@ async def deep_clean_account(client: TelegramClient, reporter: StatusReporter) -
 
     # 10. Диалоги, каналы, группы и боты
     await reporter.update(f"🧹 Тотальная зачистка чатов...\n{render_progress_bar(7, 10)}", force=True)
-    async for dialog in client.iter_dialogs():
-        entity = dialog.entity
-        try:
-            if isinstance(entity, Channel):
-                if getattr(entity, "creator", False):
-                    try:
-                        await client(DeleteChannelRequest(channel=entity))
-                        report.channels_deleted += 1
-                    except Exception:
-                        await client(LeaveChannelRequest(entity))
-                else:
-                    await client(LeaveChannelRequest(entity))
-                report.dialogs_purged += 1
-
-            elif isinstance(entity, Chat):
-                await client(DeleteChatUserRequest(chat_id=entity.id, user_id="me"))
-                report.dialogs_purged += 1
-
-            elif isinstance(entity, User):
-                if getattr(entity, "is_self", False):
-                    continue
-                if getattr(entity, "bot", False):
-                    try:
-                        await client(BlockRequest(id=entity))
-                    except Exception:
-                        pass
-                try:
-                    await client(DeleteHistoryRequest(peer=entity, max_id=0, just_clear=False, revoke=True))
-                except Exception:
-                    await client.delete_dialog(entity)
-                report.dialogs_purged += 1
-
-            if report.dialogs_purged % 10 == 0:
-                await reporter.update(
-                    f"🧹 Очищено диалогов: <b>{report.dialogs_purged}</b>\n"
-                    f"{render_progress_bar(8, 10)}"
-                )
-                await asyncio.sleep(0.8)
-            else:
-                await asyncio.sleep(0.15)
-
-        except FloodWaitError as e:
-            await reporter.update(f"⏳ FloodWait: ожидание {e.seconds} с...", force=True)
-            await asyncio.sleep(e.seconds + 1)
-        except Exception:
-            continue
+    await clean_account_dialogs(client, reporter, report)
 
     try:
         await client(ResetWebAuthorizationsRequest())
@@ -1091,6 +1133,7 @@ async def process_fast_clean_session(item: dict, bot: Bot, state: Optional[FSMCo
             f"🆔 ID: <code>{check.user_id}</code>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"🗑 Стерто диалогов: <b>{clean_report.dialogs_purged}</b>\n"
+            f"⚠️ Не очищено: <b>{clean_report.dialogs_failed}</b>\n"
             f"📇 Контакты и поисковый топ: <b>Очищены</b>\n"
             f"👑 Удалено каналов создателя: <b>{clean_report.channels_deleted}</b>\n"
             f"💳 Платежные данные: <b>Уничтожены</b>\n"
@@ -1224,6 +1267,7 @@ async def finalize(mig: ActiveMigration, message: Message, state: Optional[FSMCo
             f"<code>{html.escape(phone)}</code> · ID <code>{metadata['id']}</code>\n"
             f"{old_line}"
             f"Удалено диалогов: {clean_info.dialogs_purged}\n"
+            f"Не очищено: {clean_info.dialogs_failed}\n"
             f"Другие устройства: {reset_status}"
             f"{ttl_line}"
         )
