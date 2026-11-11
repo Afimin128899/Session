@@ -34,6 +34,111 @@ class ArchiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    async def test_fast_queue_runs_three_and_refills_free_slot(self):
+        chat_id = -920
+        self.database.set_clean_mode(chat_id, 2)
+        for index in range(5):
+            self.database.add_queue_item(str(index), chat_id, 'unused', str(index), None, None)
+        started = []
+        active = set()
+        peak = 0
+        three_started = asyncio.Event()
+        fourth_started = asyncio.Event()
+        release_first = asyncio.Event()
+        release_rest = asyncio.Event()
+
+        async def process(item, message_bot, state):
+            nonlocal peak
+            key = item['id']
+            started.append(key)
+            active.add(key)
+            peak = max(peak, len(active))
+            if len(started) == 3:
+                three_started.set()
+            if len(started) == 4:
+                fourth_started.set()
+            try:
+                await (release_first if key == started[0] else release_rest).wait()
+                self.database.remove_item(key)
+            finally:
+                active.remove(key)
+
+        with patch.object(bot, 'process_fast_clean_session', side_effect=process):
+            worker = asyncio.create_task(bot.queue_worker(chat_id, AsyncMock(), AsyncMock()))
+            try:
+                await asyncio.wait_for(three_started.wait(), 2)
+                self.assertEqual(len(active), 3)
+                self.assertEqual(len(started), 3)
+                release_first.set()
+                await asyncio.wait_for(fourth_started.wait(), 2)
+                self.assertEqual(len(active), 3)
+                release_rest.set()
+                await asyncio.wait_for(worker, 2)
+            finally:
+                worker.cancel()
+                await asyncio.gather(worker, return_exceptions=True)
+        self.assertEqual(peak, 3)
+        self.assertEqual(len(started), 5)
+        self.assertEqual(self.database.count_outstanding(chat_id), 0)
+        self.assertNotIn(chat_id, bot.queue_current_items)
+
+    async def test_pause_drains_active_sessions_without_starting_more(self):
+        chat_id = -922
+        self.database.set_clean_mode(chat_id, 2)
+        for index in range(5):
+            self.database.add_queue_item(str(index), chat_id, 'unused', str(index), None, None)
+        started = []
+        ready = asyncio.Event()
+        release = asyncio.Event()
+
+        async def process(item, message_bot, state):
+            started.append(item['id'])
+            if len(started) == 3:
+                ready.set()
+            await release.wait()
+            self.database.remove_item(item['id'])
+
+        with patch.object(bot, 'process_fast_clean_session', side_effect=process):
+            worker = asyncio.create_task(bot.queue_worker(chat_id, AsyncMock(), AsyncMock()))
+            try:
+                await asyncio.wait_for(ready.wait(), 2)
+                bot.queue_paused[chat_id] = True
+                release.set()
+                await asyncio.wait_for(worker, 2)
+            finally:
+                worker.cancel()
+                await asyncio.gather(worker, return_exceptions=True)
+                bot.queue_paused.pop(chat_id, None)
+        self.assertEqual(len(started), 3)
+        self.assertEqual(self.database.count_queue(chat_id), 2)
+
+    async def test_cancelling_supervisor_stops_all_three_sessions(self):
+        chat_id = -921
+        self.database.set_clean_mode(chat_id, 2)
+        for index in range(3):
+            self.database.add_queue_item(str(index), chat_id, 'unused', str(index), None, None)
+        active = set()
+        ready = asyncio.Event()
+
+        async def process(item, message_bot, state):
+            active.add(item['id'])
+            if len(active) == 3:
+                ready.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                active.remove(item['id'])
+
+        with patch.object(bot, 'process_fast_clean_session', side_effect=process):
+            worker = asyncio.create_task(bot.queue_worker(chat_id, AsyncMock(), AsyncMock()))
+            try:
+                await asyncio.wait_for(ready.wait(), 2)
+            finally:
+                worker.cancel()
+                await asyncio.gather(worker, return_exceptions=True)
+        self.assertEqual(active, set())
+        self.assertFalse(bot.queue_workers[chat_id])
+
     async def test_queue_flushes_successes_even_when_last_account_fails(self):
         client = AsyncMock()
         chat_id = -904

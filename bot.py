@@ -1450,60 +1450,69 @@ def start_queue_worker(chat_id: int, bot: Bot, state: FSMContext) -> Optional[as
 
 
 async def queue_worker(chat_id: int, bot: Bot, state: FSMContext):
-    sem = get_chat_semaphore(chat_id)
     current_task = asyncio.current_task()
     queue_workers[chat_id] = True
+    running: Set[asyncio.Task] = set()
+    active_names: Dict[str, str] = {}
+
+    async def process_item(item: dict, mode: int):
+        item_id = item["id"]
+        active_names[item_id] = item.get("original_name", "session")
+        queue_current_items[chat_id] = ", ".join(active_names.values())
+        try:
+            if mode == 2:
+                async with get_chat_semaphore(chat_id):
+                    await process_fast_clean_session(item, bot, state)
+            else:
+                await process_one_session(item, bot, state)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("Необработанная ошибка элемента очереди")
+            stats["failed"] += 1
+            db.remove_item(item_id)
+            try:
+                await bot.send_message(
+                    chat_id,
+                    f"❌ Сессия пропущена из-за ошибки: <code>{public_error(exc)}</code>",
+                )
+            except Exception:
+                pass
+        finally:
+            active_names.pop(item_id, None)
+            if active_names:
+                queue_current_items[chat_id] = ", ".join(active_names.values())
+            else:
+                queue_current_items.pop(chat_id, None)
+
     try:
-        async with sem:
-            while not queue_paused.get(chat_id, False):
-                active = current_migration.get(chat_id)
-                if active and (active.waiting_2fa or active.waiting_manual_code):
-                    return
-                item = db.pop_next_item(chat_id)
-                if not item:
-                    break
-                queue_current_items[chat_id] = item.get("original_name", "session")
+        while True:
+            active = current_migration.get(chat_id)
+            paused = queue_paused.get(chat_id, False)
+            waiting = active and (active.waiting_2fa or active.waiting_manual_code)
+            mode = db.get_clean_mode(chat_id, settings.default_auto_code)
+            limit = settings.concurrent_workers_per_chat if mode == 2 else 1
+            # Drain fast-clean tasks before switching to interactive migration.
+            if not paused and not waiting:
+                while len(running) < limit:
+                    item = db.pop_next_item(chat_id)
+                    if not item:
+                        break
+                    running.add(asyncio.create_task(process_item(item, mode)))
+            if not running:
+                break
+            done, running = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                task.result()
 
-                rem = db.count_queue(chat_id)
-                if rem > 0:
-                    try:
-                        await bot.send_message(chat_id, f"📋 В очереди осталось сессий: <b>{rem}</b>")
-                    except Exception:
-                        pass
-
-                mode = db.get_clean_mode(chat_id, settings.default_auto_code)
-                try:
-                    if mode == 2:
-                        await process_fast_clean_session(item, bot, state)
-                    else:
-                        await process_one_session(item, bot, state)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    # Keep one malformed item from wedging the whole queue.
-                    logger.exception("Необработанная ошибка элемента очереди")
-                    stats["failed"] += 1
-                    db.remove_item(item.get("id"))
-                    try:
-                        await bot.send_message(
-                            chat_id,
-                            f"❌ Сессия пропущена из-за ошибки: <code>{public_error(exc)}</code>",
-                        )
-                    except Exception:
-                        pass
-                finally:
-                    queue_current_items.pop(chat_id, None)
-
-                mig = current_migration.get(chat_id)
-                if mig and (mig.waiting_2fa or mig.waiting_manual_code):
-                    return
-
-                await asyncio.sleep(1.0)
-
-        if not queue_paused.get(chat_id, False) and db.count_queue(chat_id) == 0 and not current_migration.get(chat_id):
+        if not queue_paused.get(chat_id, False) and db.count_outstanding(chat_id) == 0 and not current_migration.get(chat_id):
             await try_flush_queue_archives(chat_id, bot)
             await bot.send_message(chat_id, "✅ Очередь обработана")
     finally:
+        for task in running:
+            task.cancel()
+        if running:
+            await asyncio.gather(*running, return_exceptions=True)
         queue_workers[chat_id] = False
         queue_current_items.pop(chat_id, None)
         if queue_worker_tasks.get(chat_id) is current_task:
