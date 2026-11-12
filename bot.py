@@ -114,8 +114,8 @@ class Settings(BaseSettings):
     session_timeout_minutes: int = Field(default=15, ge=1, le=1440)
     max_queue_per_user: int = Field(default=150, ge=1, le=10000)
     default_auto_code: int = 1
-    concurrent_workers_per_chat: int = Field(default=3, ge=1, le=16)
-    concurrent_dialogs_per_session: int = Field(default=50, ge=1, le=100)
+    concurrent_workers_per_chat: int = Field(default=3, ge=1, le=3)
+    concurrent_dialogs_per_session: int = Field(default=10, ge=1, le=10)
     db_file: str = "sessions_v100x.db"
 
     proxy_protocol: Optional[str] = None
@@ -123,6 +123,17 @@ class Settings(BaseSettings):
     proxy_port: Optional[int] = None
     proxy_username: Optional[str] = None
     proxy_password: Optional[str] = None
+
+    @field_validator("concurrent_workers_per_chat", mode="before")
+    @classmethod
+    def cap_session_workers(cls, value):
+        return min(int(value), 3)
+
+    @field_validator("concurrent_dialogs_per_session", mode="before")
+    @classmethod
+    def cap_dialog_batch(cls, value):
+        # Existing .env values of 50–100 must keep working after the rollback.
+        return min(int(value), 10)
 
     @field_validator("admin_ids", mode="before")
     @classmethod
@@ -438,6 +449,7 @@ class ActiveMigration:
 
 chat_semaphores: Dict[int, asyncio.Semaphore] = {}
 current_migration: Dict[int, ActiveMigration] = {}
+active_migrations: Dict[str, ActiveMigration] = {}
 queue_workers: Dict[int, bool] = {}
 queue_worker_tasks: Dict[int, asyncio.Task] = {}
 queue_paused: Dict[int, bool] = {}
@@ -446,11 +458,11 @@ archive_locks: Dict[int, asyncio.Lock] = {}
 MAX_RESULT_BYTES = 45 * 1024 * 1024
 
 
-async def flush_queue_archives(chat_id: int, bot: Bot, *, include_sent: bool = False):
+async def flush_queue_archives(chat_id: int, bot: Bot, *, include_sent: bool = False, minimum: int = 1):
     # Keep successful results on disk even after delivery, for /archives recovery.
     async with archive_locks.setdefault(chat_id, asyncio.Lock()):
         archives = db.archives(chat_id, include_sent)
-        while archives:
+        while len(archives) >= minimum:
             output = io.BytesIO()
             batch = []
             used_names = set()
@@ -485,9 +497,9 @@ async def flush_queue_archives(chat_id: int, bot: Bot, *, include_sent: bool = F
             archives = archives[len(batch):]
 
 
-async def try_flush_queue_archives(chat_id: int, bot: Bot, *, include_sent: bool = False):
+async def try_flush_queue_archives(chat_id: int, bot: Bot, *, include_sent: bool = False, minimum: int = 1):
     try:
-        await flush_queue_archives(chat_id, bot, include_sent=include_sent)
+        await flush_queue_archives(chat_id, bot, include_sent=include_sent, minimum=minimum)
     except Exception:
         logger.exception("Не удалось отправить сохранённые архивы")
         try:
@@ -511,7 +523,7 @@ async def deliver_account_archive(chat_id: int, bot: Bot, data: bytes, filename:
         except Exception:
             await try_flush_queue_archives(chat_id, bot)
     elif len(db.archives(chat_id)) >= 3:
-        await try_flush_queue_archives(chat_id, bot)
+        await try_flush_queue_archives(chat_id, bot, minimum=3)
 
 stats = {"started": 0, "success": 0, "failed": 0, "cancelled": 0, "skipped": 0}
 
@@ -757,10 +769,60 @@ async def terminate_old_session(old_client: Optional[TelegramClient]) -> Tuple[b
     return False, last_error
 
 
+async def claim_interactive_migration(mig: ActiveMigration):
+    # Only one prompt may own the chat FSM; automatic work stays independent.
+    while current_migration.get(mig.chat_id) not in (None, mig):
+        if mig.skip_requested:
+            raise asyncio.CancelledError
+        await asyncio.sleep(0.1)
+    if mig.skip_requested:
+        raise asyncio.CancelledError
+    current_migration[mig.chat_id] = mig
+    mig.last_activity = time.time()
+
+
+async def poll_login_code(client, mig, request_ts, *, timeout=90.0, read_timeout=10.0,
+                          interval=1.5):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    failures = 0
+
+    async def read_code():
+        async for msg in client.iter_messages(777000, limit=3):
+            if msg.date and msg.date.timestamp() >= request_ts:
+                code = extract_telegram_code(msg.raw_text or "")
+                if code:
+                    return code
+        return None
+
+    while loop.time() < deadline:
+        if mig.skip_requested:
+            raise asyncio.CancelledError
+        try:
+            code = await asyncio.wait_for(read_code(), min(read_timeout, deadline - loop.time()))
+            failures = 0
+            if code:
+                return code
+        except (AuthKeyUnregisteredError, UserDeactivatedError, PhoneNumberBannedError):
+            raise
+        except FloodWaitError as exc:
+            delay = exc.seconds + 1
+            if delay >= deadline - loop.time():
+                raise TimeoutError("FloodWait превышает время ожидания кода") from exc
+            await asyncio.sleep(delay)
+            continue
+        except (TimeoutError, ConnectionError, OSError) as exc:
+            failures += 1
+            logger.warning("Ошибка чтения 777000 (%s/3): %s", failures, type(exc).__name__)
+            if failures >= 3:
+                raise TimeoutError("Не удалось прочитать 777000 после трёх попыток") from exc
+        await asyncio.sleep(min(interval, max(0, deadline - loop.time())))
+    raise TimeoutError("Код от 777000 не получен за отведённое время")
+
+
 async def cleanup_migration(mig: ActiveMigration, state: Optional[FSMContext] = None):
     chat_id = mig.chat_id
-    if chat_id in current_migration and current_migration[chat_id].id == mig.id:
-        del current_migration[chat_id]
+    active_migrations.pop(mig.id, None)
 
     if mig.queue_db_id:
         db.remove_item(mig.queue_db_id)
@@ -779,6 +841,9 @@ async def cleanup_migration(mig: ActiveMigration, state: Optional[FSMContext] = 
     if state and (mig.waiting_2fa or mig.waiting_manual_code):
         await state.clear()
 
+    if chat_id in current_migration and current_migration[chat_id].id == mig.id:
+        del current_migration[chat_id]
+
     if mig.status_message and db.count_outstanding(chat_id) == 0:
         await try_flush_queue_archives(chat_id, mig.status_message.bot)
 
@@ -792,6 +857,9 @@ async def clear_user_queue(chat_id: int, state: Optional[FSMContext] = None, bot
     queue_worker_tasks.pop(chat_id, None)
     queue_paused[chat_id] = False
 
+    for mig in list(active_migrations.values()):
+        if mig.chat_id == chat_id:
+            await cleanup_migration(mig, state)
     if chat_id in current_migration:
         await cleanup_migration(current_migration[chat_id], state)
 
@@ -888,9 +956,8 @@ async def clean_account_dialogs(client: TelegramClient, reporter: StatusReporter
             await wait_for_account()
             pending.add(asyncio.create_task(clean_dialog(dialog.entity)))
             if len(pending) >= settings.concurrent_dialogs_per_session:
-                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-                for task in done:
-                    task.result()
+                await asyncio.gather(*pending)
+                pending.clear()
         if pending:
             await asyncio.gather(*pending)
     finally:
@@ -1321,16 +1388,19 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
         proxy_config=proxy_dict,
         queue_db_id=item["id"],
     )
-    current_migration[chat_id] = mig
+    active_migrations[mig.id] = mig
     reporter = StatusReporter(status)
 
     try:
+        if not auto_mode:
+            await claim_interactive_migration(mig)
         mig.temp_dir = Path(tempfile.mkdtemp(prefix=f"mig_{chat_id}_{mig_id}_"))
         old_session_path = mig.temp_dir / "old.session"
         new_session_path = str(mig.temp_dir / "new_session")
         shutil.copy(item["file_path"], old_session_path)
 
         old_client = get_configured_client(str(old_session_path.with_suffix("")), mig.fingerprint, mig.proxy_config)
+        mig.old_client = old_client
         await old_client.connect()
 
         if not await old_client.is_user_authorized():
@@ -1358,8 +1428,8 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
         )
 
         new_client = get_configured_client(new_session_path, mig.fingerprint, mig.proxy_config)
-        await new_client.connect()
         mig.new_client = new_client
+        await new_client.connect()
 
         request_ts = int(time.time()) - 5
         result = await new_client.send_code_request(phone)
@@ -1372,33 +1442,12 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
                 force=True,
                 reply_markup=action_kb(can_skip=True),
             )
-            code = None
-            start_wait = time.time()
-
-            while time.time() - start_wait < 90:
-                if mig.skip_requested:
-                    await cleanup_migration(mig, state)
-                    return
-
-                try:
-                    async for msg in old_client.iter_messages(777000, limit=3):
-                        msg_time = msg.date.timestamp() if msg.date else 0
-                        if msg_time >= request_ts:
-                            parsed = extract_telegram_code(msg.raw_text or "")
-                            if parsed:
-                                code = parsed
-                                break
-                    if code:
-                        break
-                except Exception as e:
-                    logger.debug(f"Ошибка чтения 777000: {e}")
-
-                await asyncio.sleep(1.5)
-
-            if not code:
+            try:
+                code = await poll_login_code(old_client, mig, request_ts)
+            except TimeoutError:
                 await reporter.update(
-                    f"❌ Код от 777000 для <code>{phone}</code> не получен за 90 сек.\n"
-                    "Попробуйте ручной ввод: /manual",
+                    f"❌ Не удалось дождаться кода от 777000 для <code>{phone}</code>.\n"
+                    "Истёк таймаут или недоступно чтение сообщений. Попробуйте /manual.",
                     force=True,
                 )
                 await cleanup_migration(mig)
@@ -1446,6 +1495,7 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
                 except PasswordHashInvalidError:
                     await reporter.update("⚠️️ Пароль 2FA из JSON не подошел. Введите вручную:", force=True)
 
+            await claim_interactive_migration(mig)
             mig.waiting_2fa = True
             mig.last_activity = time.time()
             await state.set_state(MigrateStates.waiting_password)
@@ -1467,6 +1517,10 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
             await cleanup_migration(mig)
             return
 
+    except asyncio.CancelledError:
+        await cleanup_migration(mig, state)
+        if not mig.skip_requested:
+            raise
     except PhoneNumberBannedError:
         await reporter.update(f"❌ Номер <code>{mig.phone}</code> заблокирован Telegram.", force=True)
         await cleanup_migration(mig)
@@ -1477,6 +1531,9 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
         logger.exception("Ошибка process_one_session")
         await reporter.update(f"❌ Сбой обработки: <code>{public_error(e)}</code>", force=True)
         await cleanup_migration(mig)
+    finally:
+        if mig.id in active_migrations and not (mig.waiting_2fa or mig.waiting_manual_code):
+            await cleanup_migration(mig)
 
 
 # ====================== ВОРКЕР ОЧЕРЕДИ ======================
@@ -1498,6 +1555,7 @@ async def queue_worker(chat_id: int, bot: Bot, state: FSMContext):
     queue_workers[chat_id] = True
     running: Set[asyncio.Task] = set()
     active_names: Dict[str, str] = {}
+    running_mode = None
 
     async def process_item(item: dict, mode: int):
         item_id = item["id"]
@@ -1535,10 +1593,13 @@ async def queue_worker(chat_id: int, bot: Bot, state: FSMContext):
             paused = queue_paused.get(chat_id, False)
             waiting = active and (active.waiting_2fa or active.waiting_manual_code)
             mode = db.get_clean_mode(chat_id, settings.default_auto_code)
-            limit = settings.concurrent_workers_per_chat if mode == 2 else 1
-            # Drain fast-clean tasks before switching to interactive migration.
-            if not paused and not waiting:
-                while len(running) < limit:
+            limit = settings.concurrent_workers_per_chat if mode in (1, 2) else 1
+            # Drain the old mode before switching (manual mode owns one FSM).
+            if not paused and not waiting and (not running or running_mode == mode):
+                running_mode = mode
+                detached = sum(m.chat_id == chat_id and m.queue_db_id not in active_names
+                               for m in active_migrations.values())
+                while len(running) + detached < limit:
                     item = db.pop_next_item(chat_id)
                     if not item:
                         break
@@ -1903,8 +1964,13 @@ async def cmd_manual(message: Message):
 
 @router.callback_query(F.data == "skip_current")
 async def cb_skip_current(call: CallbackQuery, state: FSMContext):
-    chat_id = call.from_user.id
-    mig = current_migration.get(chat_id)
+    chat_id = call.message.chat.id
+    mig = next((m for m in active_migrations.values()
+                if m.chat_id == chat_id and m.status_message.message_id == call.message.message_id), None)
+    if mig is None:
+        candidate = current_migration.get(chat_id)
+        if candidate and candidate.status_message.message_id == call.message.message_id:
+            mig = candidate
     if not mig:
         await call.answer("Нет активной сессии для пропуска.", show_alert=True)
         return
@@ -1912,7 +1978,8 @@ async def cb_skip_current(call: CallbackQuery, state: FSMContext):
     mig.skip_requested = True
     stats["skipped"] += 1
     await call.answer("Сессия пропущена. Переход к следующей...")
-    await cleanup_migration(mig, state)
+    if mig.waiting_2fa or mig.waiting_manual_code:
+        await cleanup_migration(mig, state)
 
     if db.count_queue(chat_id) > 0:
         start_queue_worker(chat_id, call.bot, state)
@@ -2253,7 +2320,13 @@ async def watchdog_task(bot: Bot):
 
 async def shutdown(dp: Dispatcher, bot: Bot):
     logger.info("Получен сигнал завершения работы. Отключение сессий...")
-    for mig in list(current_migration.values()):
+    tasks = [task for task in queue_worker_tasks.values() if not task.done()]
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    migrations = {m.id: m for m in [*active_migrations.values(), *current_migration.values()]}
+    for mig in migrations.values():
         await cleanup_migration(mig)
     await bot.session.close()
     logger.info("Все ресурсы корректно освобождены.")
@@ -2293,3 +2366,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Бот остановлен.")
+

@@ -41,7 +41,7 @@ class ParallelDialogCleanupTests(unittest.IsolatedAsyncioTestCase):
         client.iter_dialogs = dialogs
         return client
 
-    async def test_one_hundred_channels_use_fifty_concurrent_requests(self):
+    async def test_one_hundred_channels_use_ten_concurrent_requests(self):
         client = self.client([self.entity(bot.Channel, i) for i in range(100)])
         ready = asyncio.Event()
         release = asyncio.Event()
@@ -54,7 +54,7 @@ class ParallelDialogCleanupTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(kwargs['flood_sleep_threshold'], 0)
             active += 1
             peak = max(peak, active)
-            if active == 50:
+            if active == 10:
                 ready.set()
             try:
                 await release.wait()
@@ -63,17 +63,17 @@ class ParallelDialogCleanupTests(unittest.IsolatedAsyncioTestCase):
 
         client.side_effect = request
         report = bot.CleanReport()
-        with patch.object(bot.settings, 'concurrent_dialogs_per_session', 50):
+        with patch.object(bot.settings, 'concurrent_dialogs_per_session', 10):
             task = asyncio.create_task(bot.clean_account_dialogs(client, AsyncMock(), report))
             try:
                 await asyncio.wait_for(ready.wait(), 2)
-                self.assertEqual(client.await_count, 50)
+                self.assertEqual(client.await_count, 10)
                 release.set()
                 await asyncio.wait_for(task, 2)
             finally:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
-        self.assertEqual(peak, 50)
+        self.assertEqual(peak, 10)
         self.assertEqual(report.dialogs_purged, 100)
         self.assertEqual(report.dialogs_failed, 0)
 
@@ -127,7 +127,7 @@ class ParallelDialogCleanupTests(unittest.IsolatedAsyncioTestCase):
         async def request(value, **kwargs):
             nonlocal active
             active += 1
-            if active == 50:
+            if active == 10:
                 ready.set()
             try:
                 await asyncio.Event().wait()
@@ -142,7 +142,7 @@ class ParallelDialogCleanupTests(unittest.IsolatedAsyncioTestCase):
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         self.assertEqual(active, 0)
-        self.assertEqual(client.await_count, 50)
+        self.assertEqual(client.await_count, 10)
 
 
 class ArchiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
@@ -161,9 +161,15 @@ class ArchiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    async def test_auto_queue_runs_three_and_refills_free_slot(self):
+        await self.check_parallel_queue(1, 'process_one_session')
+
     async def test_fast_queue_runs_three_and_refills_free_slot(self):
+        await self.check_parallel_queue(2, 'process_fast_clean_session')
+
+    async def check_parallel_queue(self, mode, handler):
         chat_id = -920
-        self.database.set_clean_mode(chat_id, 2)
+        self.database.set_clean_mode(chat_id, mode)
         for index in range(5):
             self.database.add_queue_item(str(index), chat_id, 'unused', str(index), None, None)
         started = []
@@ -190,7 +196,7 @@ class ArchiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 active.remove(key)
 
-        with patch.object(bot, 'process_fast_clean_session', side_effect=process):
+        with patch.object(bot, handler, side_effect=process):
             worker = asyncio.create_task(bot.queue_worker(chat_id, AsyncMock(), AsyncMock()))
             try:
                 await asyncio.wait_for(three_started.wait(), 2)
@@ -726,6 +732,127 @@ class UploadQuotaTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('до 5.', bot.limits_text(1))
         self.assertEqual(self.db.get_upload_limit(1), 5)
         call.message.answer.assert_awaited_once()
+
+
+
+
+
+class LoginCodeTimeoutTests(unittest.IsolatedAsyncioTestCase):
+    async def test_hung_read_is_cancelled_within_total_timeout(self):
+        cancelled = asyncio.Event()
+        async def messages(*args, **kwargs):
+            try:
+                await asyncio.Event().wait()
+                yield None
+            finally:
+                cancelled.set()
+        client = MagicMock(iter_messages=messages)
+        mig = MagicMock(skip_requested=False)
+        with self.assertRaises(TimeoutError):
+            await asyncio.wait_for(bot.poll_login_code(client, mig, 0, timeout=.04,
+                                                       read_timeout=1, interval=0), .5)
+        self.assertTrue(cancelled.is_set())
+
+    async def test_repeated_network_errors_stop_after_three_attempts(self):
+        client = MagicMock()
+        client.iter_messages.side_effect = ConnectionError('offline')
+        with self.assertRaises(TimeoutError):
+            await bot.poll_login_code(client, MagicMock(skip_requested=False), 0,
+                                      timeout=1, interval=0)
+        self.assertEqual(client.iter_messages.call_count, 3)
+
+    async def test_stale_code_is_ignored_and_fresh_code_returned(self):
+        from datetime import datetime, timezone
+        async def messages(*args, **kwargs):
+            yield MagicMock(date=datetime.fromtimestamp(1, timezone.utc), raw_text='Code: 11111')
+            yield MagicMock(date=datetime.fromtimestamp(3, timezone.utc), raw_text='Code: 22222')
+        code = await bot.poll_login_code(MagicMock(iter_messages=messages),
+                                         MagicMock(skip_requested=False), 2, timeout=1)
+        self.assertEqual(code, '22222')
+
+    async def test_unexpected_read_error_is_not_swallowed(self):
+        client = MagicMock()
+        client.iter_messages.side_effect = ValueError('bad peer')
+        with self.assertRaises(ValueError):
+            await bot.poll_login_code(client, MagicMock(skip_requested=False), 0)
+
+
+class MigrationIsolationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_interactive_prompts_wait_for_previous_owner(self):
+        first = bot.ActiveMigration(id='first', chat_id=-950, status_message=None)
+        second = bot.ActiveMigration(id='second', chat_id=-950, status_message=None)
+        await bot.claim_interactive_migration(first)
+        task = asyncio.create_task(bot.claim_interactive_migration(second))
+        try:
+            await asyncio.sleep(.02)
+            self.assertFalse(task.done())
+            self.assertIs(bot.current_migration[-950], first)
+            await bot.cleanup_migration(first)
+            await asyncio.wait_for(task, .5)
+            self.assertIs(bot.current_migration[-950], second)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            bot.current_migration.pop(-950, None)
+
+
+class FixedBatchTests(unittest.IsolatedAsyncioTestCase):
+    entity = ParallelDialogCleanupTests.entity
+    client = ParallelDialogCleanupTests.client
+    async def test_next_batch_waits_for_entire_previous_batch(self):
+        client = self.client([self.entity(bot.Channel, i) for i in range(21)])
+        gates = [asyncio.Event() for _ in range(21)]
+        ten_started = asyncio.Event()
+        calls = 0
+        async def request(value, **kwargs):
+            nonlocal calls
+            index = calls
+            calls += 1
+            if calls == 10:
+                ten_started.set()
+            await gates[index].wait()
+        client.side_effect = request
+        task = asyncio.create_task(bot.clean_account_dialogs(client, AsyncMock(), bot.CleanReport()))
+        try:
+            await asyncio.wait_for(ten_started.wait(), .5)
+            gates[0].set()
+            await asyncio.sleep(.02)
+            self.assertEqual(calls, 10)
+            for gate in gates:
+                gate.set()
+            await asyncio.wait_for(task, .5)
+            self.assertEqual(calls, 21)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+class ArchiveGroupingRaceTests(unittest.IsolatedAsyncioTestCase):
+    setUp = ArchiveDeliveryTests.setUp
+    account_zip = ArchiveDeliveryTests.account_zip
+    async def test_parallel_completions_only_send_full_groups_until_final_flush(self):
+        client = AsyncMock()
+        await asyncio.gather(*(bot.deliver_account_archive(
+            -951, client, self.account_zip(), f'{i}.zip', 'Ready', queued=True)
+            for i in range(7)))
+        self.assertEqual(client.send_document.await_count, 2)
+        self.assertEqual(len(self.database.archives(-951)), 1)
+        for call in client.send_document.call_args_list:
+            with zipfile.ZipFile(io.BytesIO(call.kwargs['document'].data)) as archive:
+                self.assertEqual(len(archive.namelist()), 6)
+                self.assertTrue(all('/' not in n and Path(n).suffix in ('.session', '.json')
+                                    for n in archive.namelist()))
+        await bot.flush_queue_archives(-951, client)
+        self.assertEqual(client.send_document.await_count, 3)
+
+
+class ConcurrencyConfigTests(unittest.TestCase):
+    def test_legacy_high_limits_are_capped(self):
+        config = bot.Settings(_env_file=None, api_id=123, api_hash='offline',
+                              bot_token='offline', concurrent_workers_per_chat=16,
+                              concurrent_dialogs_per_session=100)
+        self.assertEqual(config.concurrent_workers_per_chat, 3)
+        self.assertEqual(config.concurrent_dialogs_per_session, 10)
 
 
 if __name__ == '__main__':
