@@ -165,6 +165,21 @@ class SortedResultsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.database.archives(-980, True, 'spam_geo')), 1)
         self.assertEqual(self.database.archives(-980, True), [])
 
+    async def test_unknown_report_displays_escaped_reason(self):
+        source = self.root / 'unknown.session'
+        source.write_bytes(b'offline fixture')
+        self.database.add_queue_item('unknown', -985, str(source), source.name, None, None)
+        item = self.database.pop_next_item(-985)
+        client = AsyncMock()
+        client.is_user_authorized.return_value = True
+        message_bot = AsyncMock()
+        with patch.object(bot, 'get_configured_client', return_value=client), \
+             patch.object(bot, 'check_spam_status', return_value=SpamResult('unknown', 'Ответ: <unrecognized> & text')):
+            await bot.process_spam_check_session(item, message_bot, AsyncMock())
+        text = message_bot.send_message.call_args.args[1]
+        self.assertIn('Не определено', text)
+        self.assertIn('Причина: Ответ: &lt;unrecognized&gt; &amp; text', text)
+
     async def test_categories_are_never_mixed_on_recovery(self):
         for category in LABELS:
             output = io.BytesIO()

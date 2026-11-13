@@ -54,7 +54,8 @@ def classify_reply(text: str) -> SpamResult:
         return SpamResult('permanent', text)
     if re.search(r'(?:limited until|ограничен(?:ия)?(?:[^.!?]{0,100})? до)\s+\d', normalized):
         return SpamResult('temporary', text)
-    return SpamResult('unknown', text or 'Пустой ответ @SpamBot')
+    return SpamResult('unknown', 'Не удалось распознать ответ @SpamBot: ' + text
+                      if text else 'Пустой ответ @SpamBot')
 
 
 async def check_spam_status(client, *, timeout: float = 30.0) -> SpamResult:
@@ -77,7 +78,9 @@ async def check_spam_status(client, *, timeout: float = 30.0) -> SpamResult:
             if getattr(exc, 'message', '') == 'FROZEN_METHOD_INVALID':
                 return SpamResult('frozen', 'Telegram: FROZEN_METHOD_INVALID')
             if attempt:
-                return SpamResult('unknown', 'Ошибка проверки: ' + type(exc).__name__)
+                return SpamResult('unknown', 'Ответ @SpamBot не получен за отведённое время после повторной попытки'
+                                  if isinstance(exc, TimeoutError) else
+                                  'Ошибка повторной проверки: ' + type(exc).__name__)
         if not attempt:
             try:
                 async with asyncio.timeout(timeout):
@@ -85,5 +88,7 @@ async def check_spam_status(client, *, timeout: float = 30.0) -> SpamResult:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                return SpamResult('unknown', 'Не удалось разблокировать @SpamBot: ' + type(exc).__name__)
+                return SpamResult('unknown', 'Истекло время разблокировки @SpamBot'
+                                  if isinstance(exc, TimeoutError) else
+                                  'Не удалось разблокировать @SpamBot: ' + type(exc).__name__)
     return SpamResult('unknown', 'Нет ответа @SpamBot')

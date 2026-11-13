@@ -1175,7 +1175,9 @@ async def process_spam_check_session(item: dict, bot: Bot, state: FSMContext):
             if getattr(exc, "message", "") == "FROZEN_METHOD_INVALID":
                 result = SpamResult("frozen", "Telegram: FROZEN_METHOD_INVALID")
             else:
-                result = SpamResult("unknown", "Ошибка подключения: " + type(exc).__name__)
+                result = SpamResult("unknown", "Истекло время подключения к Telegram (20 с)"
+                                    if isinstance(exc, TimeoutError) else
+                                    "Ошибка подключения: " + type(exc).__name__)
         finally:
             if client:
                 try:
@@ -1199,8 +1201,12 @@ async def process_spam_check_session(item: dict, bot: Bot, state: FSMContext):
         category = "spam_" + result.category
         db.save_archive(chat_id, f"{stem}.zip", output.getvalue(), category)
         try:
-            await bot.send_message(chat_id,
-                f"🔎 <code>{html.escape(item['original_name'])}</code>: <b>{SPAM_LABELS[result.category]}</b>")
+            text = f"🔎 <code>{html.escape(item['original_name'])}</code>: <b>{SPAM_LABELS[result.category]}</b>"
+            if result.category == "unknown":
+                # Bound Telegram message length and escape server-provided text.
+                reason = result.detail[:1500]
+                text += f"\nПричина: {html.escape(reason)}"
+            await bot.send_message(chat_id, text)
         except Exception:
             logger.exception("Отчёт проверки не отправлен; ZIP сохранён")
         await try_flush_queue_archives(chat_id, bot, minimum=3, category=category)
