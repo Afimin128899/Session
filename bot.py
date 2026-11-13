@@ -46,6 +46,8 @@ from aiogram.types import (
 )
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from spam_check import LABELS as SPAM_LABELS, SpamResult, check_spam_status
+
 from telethon import TelegramClient
 from telethon.errors import (
     AuthKeyUnregisteredError,
@@ -248,22 +250,25 @@ class Database:
                     delivered INTEGER NOT NULL DEFAULT 0
                 )
             """)
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(result_archives)")}
+            if "category" not in columns:
+                conn.execute("ALTER TABLE result_archives ADD COLUMN category TEXT NOT NULL DEFAULT 'accounts'")
             conn.commit()
 
-    def save_archive(self, chat_id: int, filename: str, data: bytes):
+    def save_archive(self, chat_id: int, filename: str, data: bytes, category: str = "accounts"):
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute(
-                "INSERT INTO result_archives (chat_id, filename, data) VALUES (?, ?, ?)",
-                (chat_id, Path(filename).name, data),
+                "INSERT INTO result_archives (chat_id, filename, data, category) VALUES (?, ?, ?, ?)",
+                (chat_id, Path(filename).name, data, category),
             )
             return cursor.lastrowid
 
-    def archives(self, chat_id: int, include_sent: bool = False):
+    def archives(self, chat_id: int, include_sent: bool = False, category: str = "accounts"):
         with sqlite3.connect(self.db_path) as conn:
             return conn.execute(
-                "SELECT id, filename, data FROM result_archives WHERE chat_id = ? "
+                "SELECT id, filename, data FROM result_archives WHERE chat_id = ? AND category = ? "
                 + ("" if include_sent else "AND delivered = 0 ") + "ORDER BY id",
-                (chat_id,),
+                (chat_id, category),
             ).fetchall()
 
     def mark_archives_delivered(self, ids):
@@ -458,10 +463,10 @@ archive_locks: Dict[int, asyncio.Lock] = {}
 MAX_RESULT_BYTES = 45 * 1024 * 1024
 
 
-async def flush_queue_archives(chat_id: int, bot: Bot, *, include_sent: bool = False, minimum: int = 1):
+async def flush_queue_archives(chat_id: int, bot: Bot, *, include_sent: bool = False, minimum: int = 1, category: str = "accounts"):
     # Keep successful results on disk even after delivery, for /archives recovery.
     async with archive_locks.setdefault(chat_id, asyncio.Lock()):
-        archives = db.archives(chat_id, include_sent)
+        archives = db.archives(chat_id, include_sent, category)
         while len(archives) >= minimum:
             output = io.BytesIO()
             batch = []
@@ -490,16 +495,17 @@ async def flush_queue_archives(chat_id: int, bot: Bot, *, include_sent: bool = F
                     batch.append(archive_id)
             await bot.send_document(
                 chat_id=chat_id,
-                document=BufferedInputFile(output.getvalue(), filename="accounts.zip"),
-                caption=f"📦 Аккаунтов в архиве: {len(batch)}. Копии сохранены: /archives.",
+                document=BufferedInputFile(output.getvalue(), filename=f"{category}.zip"),
+                caption=(f"📦 {SPAM_LABELS[category[5:]]}. " if category.startswith("spam_") else "📦 ")
+                        + f"Аккаунтов в архиве: {len(batch)}. Копии сохранены: /archives.",
             )
             db.mark_archives_delivered(batch)
             archives = archives[len(batch):]
 
 
-async def try_flush_queue_archives(chat_id: int, bot: Bot, *, include_sent: bool = False, minimum: int = 1):
+async def try_flush_queue_archives(chat_id: int, bot: Bot, *, include_sent: bool = False, minimum: int = 1, category: str = "accounts"):
     try:
-        await flush_queue_archives(chat_id, bot, include_sent=include_sent, minimum=minimum)
+        await flush_queue_archives(chat_id, bot, include_sent=include_sent, minimum=minimum, category=category)
     except Exception:
         logger.exception("Не удалось отправить сохранённые архивы")
         try:
@@ -524,6 +530,12 @@ async def deliver_account_archive(chat_id: int, bot: Bot, data: bytes, filename:
             await try_flush_queue_archives(chat_id, bot)
     elif len(db.archives(chat_id)) >= 3:
         await try_flush_queue_archives(chat_id, bot, minimum=3)
+
+async def flush_all_archives(chat_id: int, bot: Bot, *, include_sent: bool = False):
+    for category in ["accounts", *("spam_" + key for key in SPAM_LABELS)]:
+        if db.archives(chat_id, include_sent, category):
+            await try_flush_queue_archives(chat_id, bot, include_sent=include_sent, category=category)
+
 
 stats = {"started": 0, "success": 0, "failed": 0, "cancelled": 0, "skipped": 0}
 
@@ -683,6 +695,8 @@ def main_menu_kb(chat_id: int) -> InlineKeyboardMarkup:
         mode_label = "Миграция · авто"
     elif current_mode == 2:
         mode_label = "Быстрая очистка"
+    elif current_mode == 3:
+        mode_label = "Проверка спамблока"
     else:
         mode_label = "Миграция · вручную"
 
@@ -694,6 +708,7 @@ def main_menu_kb(chat_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Вход по сессии", callback_data="btn_session_login")],
         [InlineKeyboardButton(text="Новая сессия", callback_data="btn_new_session")],
+        [InlineKeyboardButton(text="Проверка спамблока", callback_data="check_spam")],
         [InlineKeyboardButton(text=f"Режим: {mode_label}", callback_data="cycle_clean_mode")],
         [
             InlineKeyboardButton(text="Статус", callback_data="queue_status"),
@@ -878,7 +893,7 @@ async def clear_user_queue(chat_id: int, state: Optional[FSMContext] = None, bot
     if state:
         await state.clear()
     if bot:
-        await try_flush_queue_archives(chat_id, bot)
+        await flush_all_archives(chat_id, bot)
 
 
 # ====================== ЭКСТРЕМАЛЬНАЯ ОЧИСТКА ======================
@@ -1123,6 +1138,77 @@ async def quick_check_session(client: TelegramClient) -> SessionCheckResult:
         return SessionCheckResult(is_valid=False, status="KEY_REVOKED", error="Ключ авторизации отозван")
     except Exception as e:
         return SessionCheckResult(is_valid=False, status="ERROR", error=public_error(e))
+
+
+async def process_spam_check_session(item: dict, bot: Bot, state: FSMContext):
+    """Check a copy of the supplied session, retaining its existing authorization."""
+    chat_id = item["chat_id"]
+    source = Path(item["file_path"])
+    client = None
+    temp_dir = Path(tempfile.mkdtemp(prefix=f"spam_{chat_id}_"))
+    try:
+        session_copy = temp_dir / "check.session"
+        shutil.copy(source, session_copy)
+        metadata = {}
+        json_source = source.with_suffix(".json")
+        if json_source.exists():
+            try:
+                value = json.loads(json_source.read_text(encoding="utf-8"))
+                if isinstance(value, dict):
+                    metadata = value
+            except (ValueError, OSError):
+                pass
+        result = SpamResult("unknown", "Проверка не завершена")
+        try:
+            proxy = json.loads(item["proxy_json"]) if item.get("proxy_json") else None
+            client = get_configured_client(str(session_copy.with_suffix("")), get_random_fingerprint(), proxy)
+            async with asyncio.timeout(20):
+                await client.connect()
+                authorized = await client.is_user_authorized()
+            if authorized:
+                result = await check_spam_status(client)
+            else:
+                result = SpamResult("unknown", "Сессия не авторизована")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if getattr(exc, "message", "") == "FROZEN_METHOD_INVALID":
+                result = SpamResult("frozen", "Telegram: FROZEN_METHOD_INVALID")
+            else:
+                result = SpamResult("unknown", "Ошибка подключения: " + type(exc).__name__)
+        finally:
+            if client:
+                try:
+                    async with asyncio.timeout(10):
+                        await client.disconnect()
+                except Exception:
+                    logger.warning("Не удалось отключить сессию проверки спамблока", exc_info=True)
+
+        # Preserve input JSON fields (including 2FA); attach the evidence for classification.
+        stem = source.stem
+        metadata["spam_check"] = {
+            "category": result.category,
+            "label": SPAM_LABELS[result.category],
+            "detail": result.detail,
+            "checked_at": datetime.now().astimezone().isoformat(),
+        }
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.write(session_copy, arcname=f"{stem}.session")
+            archive.writestr(f"{stem}.json", json.dumps(metadata, ensure_ascii=False, indent=2))
+        category = "spam_" + result.category
+        db.save_archive(chat_id, f"{stem}.zip", output.getvalue(), category)
+        try:
+            await bot.send_message(chat_id,
+                f"🔎 <code>{html.escape(item['original_name'])}</code>: <b>{SPAM_LABELS[result.category]}</b>")
+        except Exception:
+            logger.exception("Отчёт проверки не отправлен; ZIP сохранён")
+        await try_flush_queue_archives(chat_id, bot, minimum=3, category=category)
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        db.remove_item(item["id"])
+        if db.count_outstanding(chat_id) == 0:
+            await flush_all_archives(chat_id, bot)
 
 
 async def process_fast_clean_session(item: dict, bot: Bot, state: Optional[FSMContext] = None):
@@ -1562,9 +1648,12 @@ async def queue_worker(chat_id: int, bot: Bot, state: FSMContext):
         active_names[item_id] = item.get("original_name", "session")
         queue_current_items[chat_id] = ", ".join(active_names.values())
         try:
-            if mode == 2:
+            if mode in (2, 3):
                 async with get_chat_semaphore(chat_id):
-                    await process_fast_clean_session(item, bot, state)
+                    if mode == 3:
+                        await process_spam_check_session(item, bot, state)
+                    else:
+                        await process_fast_clean_session(item, bot, state)
             else:
                 await process_one_session(item, bot, state)
         except asyncio.CancelledError:
@@ -1593,7 +1682,7 @@ async def queue_worker(chat_id: int, bot: Bot, state: FSMContext):
             paused = queue_paused.get(chat_id, False)
             waiting = active and (active.waiting_2fa or active.waiting_manual_code)
             mode = db.get_clean_mode(chat_id, settings.default_auto_code)
-            limit = settings.concurrent_workers_per_chat if mode in (1, 2) else 1
+            limit = settings.concurrent_workers_per_chat if mode in (1, 2, 3) else 1
             # Drain the old mode before switching (manual mode owns one FSM).
             if not paused and not waiting and (not running or running_mode == mode):
                 running_mode = mode
@@ -1611,7 +1700,7 @@ async def queue_worker(chat_id: int, bot: Bot, state: FSMContext):
                 task.result()
 
         if not queue_paused.get(chat_id, False) and db.count_outstanding(chat_id) == 0 and not current_migration.get(chat_id):
-            await try_flush_queue_archives(chat_id, bot)
+            await flush_all_archives(chat_id, bot)
             await bot.send_message(chat_id, "✅ Очередь обработана")
     finally:
         for task in running:
@@ -1631,30 +1720,34 @@ router = Router()
 
 @router.message(Command("archives"))
 async def cmd_archives(message: Message):
-    if not db.archives(message.chat.id, include_sent=True):
+    if not any(db.archives(message.chat.id, True, category)
+               for category in ["accounts", *("spam_" + key for key in SPAM_LABELS)]):
         await message.answer("Сохранённых архивов для этого чата нет.")
         return
-    await try_flush_queue_archives(message.chat.id, message.bot, include_sent=True)
+    await flush_all_archives(message.chat.id, message.bot, include_sent=True)
 
 
-MODE_LABELS = {1: "Миграция · авто", 2: "Быстрая очистка", 0: "Миграция · вручную"}
+MODE_LABELS = {1: "Миграция · авто", 2: "Быстрая очистка", 0: "Миграция · вручную",
+               3: "Проверка спамблока"}
 
 
 def menu_text(chat_id: int) -> str:
     mode = db.get_clean_mode(chat_id, settings.default_auto_code)
     pending = db.count_queue(chat_id)
+    description = ("Проверка через @SpamBot и ZIP по категориям." if mode == 3 else
+                   "Миграция завершает старую сессию. Очистка удаляет данные аккаунта.")
     if db.compact_menu(chat_id):
         return (
             "<b>Меню</b>\n"
             f"{MODE_LABELS.get(mode, 'Миграция · вручную')} · В очереди: {pending}\n"
-            "Миграция завершает старую сессию. Очистка удаляет данные аккаунта."
+            f"{description}"
         )
     return (
         "<b>Управление сессиями</b>\n\n"
         f"Режим: <b>{MODE_LABELS.get(mode, 'Миграция · вручную')}</b>\n"
         f"В очереди: <b>{pending}</b>\n\n"
         "Выберите действие. Для смены режима нажмите на его название.\n"
-        "Миграция завершает старую сессию. Очистка удаляет данные аккаунта."
+        f"{description}"
     )
 
 
@@ -1744,7 +1837,8 @@ async def cb_help(call: CallbackQuery):
         "<b>Режимы</b>\n"
         "Миграция · авто — автоматическое получение кода.\n"
         "Миграция · вручную — код вводите вы.\n"
-        "Быстрая очистка — удаление данных без переноса сессии.\n\n"
+        "Быстрая очистка — удаление данных без переноса сессии.\n"
+        "Проверка спамблока — ответ @SpamBot и ZIP по категориям.\n\n"
         "Файлы: .session или ZIP с парными JSON, до 20 МБ.\n"
         f"Лимит очереди: {db.get_upload_limit(call.message.chat.id)} сессий.\n\n"
         "/start — меню, /status — очередь, /cancel — отменить всё.\n"
@@ -1929,6 +2023,26 @@ async def cb_session_login(call: CallbackQuery):
         "Файлы будут обработаны в выбранном режиме.\n"
         "Миграция завершает старую сессию. Очистка удаляет данные аккаунта.",
         reply_markup=main_menu_kb(call.message.chat.id),
+    )
+
+
+@router.callback_query(F.data == "check_spam")
+async def cb_check_spam(call: CallbackQuery):
+    chat_id = call.message.chat.id
+    if db.count_outstanding(chat_id) or chat_id in current_migration:
+        await call.answer("Сначала завершите или сбросьте текущую очередь", show_alert=True)
+        return
+    db.set_clean_mode(chat_id, 3)
+    await call.answer("Проверка спамблока")
+    await call.message.answer(
+        "🔎 <b>Проверка спамблока</b>\n\n"
+        "Отправьте .session или ZIP с сессиями и JSON, затем нажмите «Проверить и запустить».\n"
+        "Категории: без спамблока, вечный, временный, по гео, заморожен.\n"
+        "Ответ про строгую реакцию на номера телефонов относится к категории «по гео».\n"
+        "Неизвестный ответ или ошибка — «Не определено».\n\n"
+        "Бот отправит /start официальному @SpamBot. При неудаче разблокирует его и повторит проверку.\n"
+        "Результаты — отдельные ZIP по категориям; исходные JSON-поля сохраняются.",
+        reply_markup=main_menu_kb(chat_id),
     )
 
 
@@ -2172,8 +2286,10 @@ async def process_document_upload(message: Message, state: FSMContext):
         f"Сессий добавлено: <b>{added_count}</b>\n"
         f"В очереди: <b>{total_queue}</b>\n\n"
         f"Выбран режим: <b>{MODE_LABELS.get(db.get_clean_mode(chat_id), 'Миграция · вручную')}</b>.\n"
-        "Миграция завершает старую сессию. Быстрая очистка удаляет данные аккаунта.\n"
-        "Обработка начнётся после вашего подтверждения.",
+        + ("Проверка через @SpamBot; при сбое бот будет разблокирован для повторной попытки.\n"
+         if db.get_clean_mode(chat_id) == 3 else
+         "Миграция завершает старую сессию. Быстрая очистка удаляет данные аккаунта.\n")
+        + "Обработка начнётся после вашего подтверждения.",
         reply_markup=queued_review_kb(),
     )
 
