@@ -196,20 +196,56 @@ class SortedResultsTests(unittest.IsolatedAsyncioTestCase):
     async def test_button_selects_mode_and_explains_retry(self):
         call = AsyncMock()
         call.message.chat.id = -983
-        await bot.cb_check_spam(call)
+        await bot.cb_check_spam(call, AsyncMock())
         self.assertEqual(self.database.get_clean_mode(-983), 3)
         self.assertIn('@SpamBot', call.message.answer.call_args.args[0])
         self.assertIn('разблокирует', call.message.answer.call_args.args[0])
         self.assertIn('Проверка спамблока', bot.menu_text(-983))
 
-    async def test_button_refuses_to_change_existing_queue(self):
+    async def test_button_starts_previously_uploaded_sessions(self):
         self.database.add_queue_item('queued', -984, 'unused', 'unused', None, None)
         call = AsyncMock()
         call.message.chat.id = -984
-        await bot.cb_check_spam(call)
-        self.assertNotEqual(self.database.get_clean_mode(-984), 3)
-        call.message.answer.assert_not_awaited()
-        self.assertTrue(call.answer.call_args.kwargs['show_alert'])
+        bot.queue_paused[-984] = True
+        with patch.object(bot, 'start_queue_worker') as start:
+            await bot.cb_check_spam(call, AsyncMock())
+        self.assertEqual(self.database.get_clean_mode(-984), 3)
+        self.assertEqual(self.database.count_outstanding(-984), 1)
+        self.assertFalse(bot.queue_paused.pop(-984))
+        start.assert_called_once()
+        self.assertIn('запущена', call.message.answer.call_args.args[0])
+
+    async def test_button_recovers_interrupted_rows_without_deleting_files(self):
+        source = self.root / 'interrupted.session'
+        source.write_bytes(b'fixture')
+        self.database.add_queue_item('interrupted', -986, str(source), source.name, None, None)
+        self.database.pop_next_item(-986)
+        self.assertEqual(self.database.count_queue(-986), 0)
+        call = AsyncMock()
+        call.message.chat.id = -986
+        with patch.object(bot, 'start_queue_worker') as start:
+            await bot.cb_check_spam(call, AsyncMock())
+        self.assertEqual(self.database.count_queue(-986), 1)
+        self.assertTrue(source.exists())
+        start.assert_called_once()
+        bot.queue_paused.pop(-986, None)
+
+    async def test_button_keeps_live_processing_rows_untouched(self):
+        self.database.add_queue_item('live', -987, 'unused', 'unused', None, None)
+        self.database.pop_next_item(-987)
+        self.database.add_queue_item('next', -987, 'unused', 'unused', None, None)
+        worker = MagicMock()
+        worker.done.return_value = False
+        call = AsyncMock()
+        call.message.chat.id = -987
+        with patch.dict(bot.queue_worker_tasks, {-987: worker}), \
+             patch.object(bot, 'start_queue_worker') as start:
+            await bot.cb_check_spam(call, AsyncMock())
+        self.assertEqual(self.database.count_queue(-987), 1)
+        self.assertEqual(self.database.count_outstanding(-987), 2)
+        self.assertIn('Текущая обработка завершится', call.message.answer.call_args.args[0])
+        start.assert_called_once()
+        bot.queue_paused.pop(-987, None)
 
     async def test_mode_three_dispatches_to_spam_check_only(self):
         self.database.set_clean_mode(-982, 3)

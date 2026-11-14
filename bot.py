@@ -331,6 +331,12 @@ class Database:
                 return dict(row)
         return None
 
+    def requeue_interrupted(self, chat_id: int):
+        """Called only when this chat has no live worker or migration."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("UPDATE queue SET status = 'pending' WHERE chat_id = ? AND status = 'processing'",
+                         (chat_id,))
+
     def remove_item(self, item_id: str):
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("DELETE FROM queue WHERE id = ?", (item_id,))
@@ -2033,19 +2039,33 @@ async def cb_session_login(call: CallbackQuery):
 
 
 @router.callback_query(F.data == "check_spam")
-async def cb_check_spam(call: CallbackQuery):
+async def cb_check_spam(call: CallbackQuery, state: FSMContext):
     chat_id = call.message.chat.id
-    if db.count_outstanding(chat_id) or chat_id in current_migration:
-        await call.answer("Сначала завершите или сбросьте текущую очередь", show_alert=True)
-        return
+    worker = queue_worker_tasks.get(chat_id)
+    live_worker = worker is not None and not worker.done()
+    live_migration = (chat_id in current_migration or
+                      any(m.chat_id == chat_id for m in active_migrations.values()))
+    if not live_worker and not live_migration:
+        # Recover rows left in "processing" by a stopped process without deleting inputs.
+        db.requeue_interrupted(chat_id)
     db.set_clean_mode(chat_id, 3)
+    pending = db.count_queue(chat_id)
+    if pending:
+        queue_paused[chat_id] = False
+        start_queue_worker(chat_id, call.bot, state)
     await call.answer("Проверка спамблока")
+    if pending:
+        text = (f"🔎 <b>Проверка спамблока</b>\nСессий ожидает проверки: <b>{pending}</b>.\n"
+                + ("Текущая обработка завершится, затем проверю ожидающие сессии.\n"
+                   if live_worker or live_migration else "Проверка загруженных сессий запущена.\n"))
+    else:
+        text = ("🔎 <b>Проверка спамблока</b>\n\n"
+                "Отправьте .session или ZIP с сессиями и JSON, затем нажмите «Проверить и запустить».\n")
     await call.message.answer(
-        "🔎 <b>Проверка спамблока</b>\n\n"
-        "Отправьте .session или ZIP с сессиями и JSON, затем нажмите «Проверить и запустить».\n"
+        text +
         "Категории: без спамблока, вечный, временный, по гео, заморожен.\n"
         "Ответ про строгую реакцию на номера телефонов относится к категории «по гео».\n"
-        "Неизвестный ответ или ошибка — «Не определено».\n\n"
+        "Неизвестный ответ или ошибка — «Не определено» с причиной.\n\n"
         "Бот отправит /start официальному @SpamBot. При неудаче разблокирует его и повторит проверку.\n"
         "Результаты — отдельные ZIP по категориям; исходные JSON-поля сохраняются.",
         reply_markup=main_menu_kb(chat_id),
