@@ -161,22 +161,28 @@ class ArchiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    async def test_auto_queue_runs_three_and_refills_free_slot(self):
+    async def test_auto_queue_runs_ten_and_refills_free_slot(self):
         await self.check_parallel_queue(1, 'process_one_session')
 
-    async def test_fast_queue_runs_three_and_refills_free_slot(self):
+    async def test_fast_queue_runs_ten_and_refills_free_slot(self):
         await self.check_parallel_queue(2, 'process_fast_clean_session')
+
+    async def test_spam_queue_runs_ten_and_refills_free_slot(self):
+        await self.check_parallel_queue(3, 'process_spam_check_session')
+
+    async def test_device_queue_runs_ten_and_refills_free_slot(self):
+        await self.check_parallel_queue(4, 'process_reset_devices_session')
 
     async def check_parallel_queue(self, mode, handler):
         chat_id = -920
         self.database.set_clean_mode(chat_id, mode)
-        for index in range(5):
+        for index in range(12):
             self.database.add_queue_item(str(index), chat_id, 'unused', str(index), None, None)
         started = []
         active = set()
         peak = 0
-        three_started = asyncio.Event()
-        fourth_started = asyncio.Event()
+        ten_started = asyncio.Event()
+        eleventh_started = asyncio.Event()
         release_first = asyncio.Event()
         release_rest = asyncio.Event()
 
@@ -186,10 +192,10 @@ class ArchiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
             started.append(key)
             active.add(key)
             peak = max(peak, len(active))
-            if len(started) == 3:
-                three_started.set()
-            if len(started) == 4:
-                fourth_started.set()
+            if len(started) == 10:
+                ten_started.set()
+            if len(started) == 11:
+                eleventh_started.set()
             try:
                 await (release_first if key == started[0] else release_rest).wait()
                 self.database.remove_item(key)
@@ -199,26 +205,26 @@ class ArchiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(bot, handler, side_effect=process):
             worker = asyncio.create_task(bot.queue_worker(chat_id, AsyncMock(), AsyncMock()))
             try:
-                await asyncio.wait_for(three_started.wait(), 2)
-                self.assertEqual(len(active), 3)
-                self.assertEqual(len(started), 3)
+                await asyncio.wait_for(ten_started.wait(), 2)
+                self.assertEqual(len(active), 10)
+                self.assertEqual(len(started), 10)
                 release_first.set()
-                await asyncio.wait_for(fourth_started.wait(), 2)
-                self.assertEqual(len(active), 3)
+                await asyncio.wait_for(eleventh_started.wait(), 2)
+                self.assertEqual(len(active), 10)
                 release_rest.set()
                 await asyncio.wait_for(worker, 2)
             finally:
                 worker.cancel()
                 await asyncio.gather(worker, return_exceptions=True)
-        self.assertEqual(peak, 3)
-        self.assertEqual(len(started), 5)
+        self.assertEqual(peak, 10)
+        self.assertEqual(len(started), 12)
         self.assertEqual(self.database.count_outstanding(chat_id), 0)
         self.assertNotIn(chat_id, bot.queue_current_items)
 
     async def test_pause_drains_active_sessions_without_starting_more(self):
         chat_id = -922
         self.database.set_clean_mode(chat_id, 2)
-        for index in range(5):
+        for index in range(12):
             self.database.add_queue_item(str(index), chat_id, 'unused', str(index), None, None)
         started = []
         ready = asyncio.Event()
@@ -226,7 +232,7 @@ class ArchiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
         async def process(item, message_bot, state):
             started.append(item['id'])
-            if len(started) == 3:
+            if len(started) == 10:
                 ready.set()
             await release.wait()
             self.database.remove_item(item['id'])
@@ -242,20 +248,20 @@ class ArchiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 worker.cancel()
                 await asyncio.gather(worker, return_exceptions=True)
                 bot.queue_paused.pop(chat_id, None)
-        self.assertEqual(len(started), 3)
+        self.assertEqual(len(started), 10)
         self.assertEqual(self.database.count_queue(chat_id), 2)
 
-    async def test_cancelling_supervisor_stops_all_three_sessions(self):
+    async def test_cancelling_supervisor_stops_all_ten_sessions(self):
         chat_id = -921
         self.database.set_clean_mode(chat_id, 2)
-        for index in range(3):
+        for index in range(10):
             self.database.add_queue_item(str(index), chat_id, 'unused', str(index), None, None)
         active = set()
         ready = asyncio.Event()
 
         async def process(item, message_bot, state):
             active.add(item['id'])
-            if len(active) == 3:
+            if len(active) == 10:
                 ready.set()
             try:
                 await asyncio.Event().wait()
@@ -296,26 +302,25 @@ class ArchiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
         with zipfile.ZipFile(io.BytesIO(client.send_document.call_args.kwargs['document'].data)) as archive:
             self.assertEqual(len(archive.namelist()), 4)
 
-    async def test_three_accounts_are_sent_as_flat_session_json_files(self):
+    async def test_ten_accounts_are_sent_as_flat_session_json_files(self):
         client = AsyncMock()
         chat_id = -901
         inner = io.BytesIO()
         with zipfile.ZipFile(inner, 'w') as archive:
             archive.writestr('account.session', b'offline fixture')
             archive.writestr('account.json', b'{"id": 123}')
-        for _ in range(3):
+        for _ in range(10):
             await bot.deliver_account_archive(
                 chat_id, client, inner.getvalue(), 'same.zip', 'Ready', queued=True,
             )
-        # Third result triggers delivery without waiting for the rest of the queue.
-        await bot.flush_queue_archives(chat_id, client)
+        # Tenth result triggers delivery without waiting for the rest of the queue.
         client.send_document.assert_awaited_once()
         document = client.send_document.call_args.kwargs['document']
         self.assertEqual(document.filename, 'accounts.zip')
         with zipfile.ZipFile(io.BytesIO(document.data)) as bundle:
             self.assertEqual(bundle.namelist(), [
-                'account.session', 'account.json', 'account_2.session', 'account_2.json',
-                'account_3.session', 'account_3.json',
+                f'account{"_" + str(i) if i > 1 else ""}.{ext}'
+                for i in range(1, 11) for ext in ('session', 'json')
             ])
             for name in bundle.namelist():
                 expected = b'offline fixture' if name.endswith('.session') else b'{"id": 123}'
@@ -336,20 +341,20 @@ class ArchiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
         await bot.flush_queue_archives(chat_id, client)
         self.assertEqual(self.database.archives(chat_id), [])
 
-    async def test_nine_accounts_send_three_batches_before_queue_finishes(self):
+    async def test_twenty_accounts_send_two_batches_before_queue_finishes(self):
         client = AsyncMock()
-        for index in range(9):
+        for index in range(20):
             await bot.deliver_account_archive(-908, client, self.account_zip(), f'{index}.zip', 'Ready', queued=True)
-            self.assertEqual(client.send_document.await_count, (index + 1) // 3)
+            self.assertEqual(client.send_document.await_count, (index + 1) // 10)
         self.assertEqual(self.database.archives(-908), [])
-        self.assertEqual(len(self.database.archives(-908, include_sent=True)), 9)
+        self.assertEqual(len(self.database.archives(-908, include_sent=True)), 20)
 
-    async def test_automatic_delivery_failure_preserves_all_three(self):
+    async def test_automatic_delivery_failure_preserves_all_ten(self):
         client = AsyncMock()
         client.send_document.side_effect = OSError('offline')
-        for index in range(3):
+        for index in range(10):
             await bot.deliver_account_archive(-909, client, self.account_zip(), f'{index}.zip', 'Ready', queued=True)
-        self.assertEqual(len(self.database.archives(-909)), 3)
+        self.assertEqual(len(self.database.archives(-909)), 10)
         self.assertIn('/archives', client.send_message.call_args.args[1])
         restored = bot.Database(self.database.db_path)
         client.send_document.side_effect = None
@@ -796,6 +801,107 @@ class MigrationIsolationTests(unittest.IsolatedAsyncioTestCase):
             bot.current_migration.pop(-950, None)
 
 
+class QueuePasswordSkipTests(unittest.IsolatedAsyncioTestCase):
+    setUp = ArchiveDeliveryTests.setUp
+
+    async def test_auto_queue_skips_missing_and_incorrect_passwords(self):
+        for password in (None, 'wrong-password'):
+            with self.subTest(password=password):
+                await self.check_auto_password(password, skipped=True)
+
+    async def test_auto_queue_uses_correct_json_password(self):
+        await self.check_auto_password('correct-password', skipped=False)
+
+    async def check_auto_password(self, password, *, skipped):
+        chat_id = -953
+        self.database.set_clean_mode(chat_id, 1)
+        source = Path(self.tmp.name) / 'fixture.session'
+        source.write_bytes(b'offline fixture')
+        self.database.add_queue_item('password', chat_id, str(source), source.name, password, None)
+        item = self.database.pop_next_item(chat_id)
+        old = MagicMock()
+        old.connect = AsyncMock()
+        old.disconnect = AsyncMock()
+        old.is_user_authorized = AsyncMock(return_value=True)
+        old.get_me = AsyncMock(return_value=MagicMock(phone='12345678901'))
+        new = MagicMock()
+        new.connect = AsyncMock()
+        new.disconnect = AsyncMock()
+        new.send_code_request = AsyncMock(return_value=MagicMock(phone_code_hash='fixture'))
+        errors = [bot.SessionPasswordNeededError(request=None)]
+        if password:
+            errors.append(bot.PasswordHashInvalidError(request=None) if skipped else None)
+        new.sign_in = AsyncMock(side_effect=errors)
+        client = AsyncMock()
+        client.send_message.return_value.bot = client
+        state = AsyncMock()
+        before = bot.stats['skipped']
+        with patch.object(bot, 'get_configured_client', side_effect=[old, new]), \
+             patch.object(bot, 'poll_login_code', new=AsyncMock(return_value='12345')), \
+             patch.object(bot, 'claim_interactive_migration', new=AsyncMock()) as claim, \
+             patch.object(bot, 'terminate_old_session', new=AsyncMock(return_value=(True, None))) as logout, \
+             patch.object(bot, 'finalize', new=AsyncMock()) as finalize:
+            await bot.process_one_session(item, client, state)
+        state.set_state.assert_not_awaited()
+        claim.assert_not_awaited()
+        self.assertEqual(bot.stats['skipped'] - before, int(skipped))
+        self.assertEqual(finalize.await_count, int(not skipped))
+        self.assertEqual(logout.await_count, int(not skipped))
+        self.assertEqual(new.sign_in.await_count, 2 if password else 1)
+        if skipped:
+            old.disconnect.assert_awaited_once()
+        new.disconnect.assert_awaited_once()
+        self.assertEqual(self.database.count_outstanding(chat_id), 0)
+        self.assertFalse(any(m.chat_id == chat_id for m in bot.active_migrations.values()))
+        self.assertNotIn(chat_id, bot.current_migration)
+        self.assertTrue(source.exists())
+
+    async def test_manual_code_in_queue_skips_password_and_resumes_queue(self):
+        chat_id = -954
+        for key in ('password', 'next'):
+            self.database.add_queue_item(key, chat_id, 'unused', key, None, None)
+        new = MagicMock()
+        new.sign_in = AsyncMock(side_effect=bot.SessionPasswordNeededError(request=None))
+        new.disconnect = AsyncMock()
+        mig = bot.ActiveMigration(id='manual-password', chat_id=chat_id, new_client=new,
+                                  queue_db_id='password', waiting_manual_code=True)
+        bot.current_migration[chat_id] = mig
+        bot.active_migrations[mig.id] = mig
+        message = AsyncMock()
+        message.chat.id = chat_id
+        message.text = '12345'
+        state = AsyncMock()
+        with patch.object(bot, 'start_queue_worker') as start:
+            await bot.process_manual_code(message, state)
+        start.assert_called_once_with(chat_id, message.bot, state)
+        state.clear.assert_awaited_once()
+        state.set_state.assert_not_awaited()
+        new.disconnect.assert_awaited_once()
+        self.assertNotIn(chat_id, bot.current_migration)
+        self.assertNotIn(mig.id, bot.active_migrations)
+        self.assertEqual(self.database.count_outstanding(chat_id), 1)
+
+    async def test_individual_login_still_allows_manual_password(self):
+        chat_id = -955
+        new = MagicMock()
+        new.sign_in = AsyncMock(side_effect=bot.SessionPasswordNeededError(request=None))
+        mig = bot.ActiveMigration(id='individual-password', chat_id=chat_id, new_client=new,
+                                  is_new_session=True, waiting_manual_code=True)
+        bot.current_migration[chat_id] = mig
+        bot.active_migrations[mig.id] = mig
+        message = AsyncMock()
+        message.chat.id = chat_id
+        message.text = '12345'
+        state = AsyncMock()
+        try:
+            await bot.process_manual_code(message, state)
+            self.assertTrue(mig.waiting_2fa)
+            state.set_state.assert_awaited_once_with(bot.MigrateStates.waiting_password)
+        finally:
+            bot.current_migration.pop(chat_id, None)
+            bot.active_migrations.pop(mig.id, None)
+
+
 class FixedBatchTests(unittest.IsolatedAsyncioTestCase):
     entity = ParallelDialogCleanupTests.entity
     client = ParallelDialogCleanupTests.client
@@ -834,12 +940,12 @@ class ArchiveGroupingRaceTests(unittest.IsolatedAsyncioTestCase):
         client = AsyncMock()
         await asyncio.gather(*(bot.deliver_account_archive(
             -951, client, self.account_zip(), f'{i}.zip', 'Ready', queued=True)
-            for i in range(7)))
+            for i in range(21)))
         self.assertEqual(client.send_document.await_count, 2)
         self.assertEqual(len(self.database.archives(-951)), 1)
         for call in client.send_document.call_args_list:
             with zipfile.ZipFile(io.BytesIO(call.kwargs['document'].data)) as archive:
-                self.assertEqual(len(archive.namelist()), 6)
+                self.assertEqual(len(archive.namelist()), 20)
                 self.assertTrue(all('/' not in n and Path(n).suffix in ('.session', '.json')
                                     for n in archive.namelist()))
         await bot.flush_queue_archives(-951, client)
@@ -847,13 +953,23 @@ class ArchiveGroupingRaceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ConcurrencyConfigTests(unittest.TestCase):
+    def test_default_queue_limit_is_ten(self):
+        config = bot.Settings(_env_file=None, api_id=123, api_hash='offline', bot_token='offline')
+        self.assertEqual(config.concurrent_workers_per_chat, 10)
+
+    def test_lower_queue_limit_is_preserved(self):
+        config = bot.Settings(_env_file=None, api_id=123, api_hash='offline',
+                              bot_token='offline', concurrent_workers_per_chat=2)
+        self.assertEqual(config.concurrent_workers_per_chat, 2)
+
     def test_legacy_high_limits_are_capped(self):
         config = bot.Settings(_env_file=None, api_id=123, api_hash='offline',
                               bot_token='offline', concurrent_workers_per_chat=16,
                               concurrent_dialogs_per_session=100)
-        self.assertEqual(config.concurrent_workers_per_chat, 3)
+        self.assertEqual(config.concurrent_workers_per_chat, 10)
         self.assertEqual(config.concurrent_dialogs_per_session, 10)
 
 
 if __name__ == '__main__':
     unittest.main()
+

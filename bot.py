@@ -117,7 +117,7 @@ class Settings(BaseSettings):
     session_timeout_minutes: int = Field(default=15, ge=1, le=1440)
     max_queue_per_user: int = Field(default=150, ge=1, le=10000)
     default_auto_code: int = 1
-    concurrent_workers_per_chat: int = Field(default=3, ge=1, le=3)
+    concurrent_workers_per_chat: int = Field(default=10, ge=1, le=10)
     concurrent_dialogs_per_session: int = Field(default=10, ge=1, le=10)
     db_file: str = "sessions_v100x.db"
 
@@ -130,7 +130,7 @@ class Settings(BaseSettings):
     @field_validator("concurrent_workers_per_chat", mode="before")
     @classmethod
     def cap_session_workers(cls, value):
-        return min(int(value), 3)
+        return min(int(value), 10)
 
     @field_validator("concurrent_dialogs_per_session", mode="before")
     @classmethod
@@ -468,6 +468,7 @@ queue_paused: Dict[int, bool] = {}
 queue_current_items: Dict[int, str] = {}
 archive_locks: Dict[int, asyncio.Lock] = {}
 MAX_RESULT_BYTES = 45 * 1024 * 1024
+RESULTS_PER_ARCHIVE = 10
 ARCHIVE_LABELS = {"accounts": "", **{"spam_" + k: v for k, v in SPAM_LABELS.items()},
                   **{"devices_" + k: v for k, v in DEVICE_LABELS.items()}}
 
@@ -481,7 +482,7 @@ async def flush_queue_archives(chat_id: int, bot: Bot, *, include_sent: bool = F
             batch = []
             used_names = set()
             with zipfile.ZipFile(output, "w", zipfile.ZIP_STORED) as bundle:
-                for archive_id, name, data in archives[:3]:
+                for archive_id, name, data in archives[:RESULTS_PER_ARCHIVE]:
                     with zipfile.ZipFile(io.BytesIO(data)) as account:
                         members = [entry for entry in account.infolist()
                                    if not entry.is_dir() and Path(entry.filename).suffix.lower() in {".session", ".json"}]
@@ -537,8 +538,8 @@ async def deliver_account_archive(chat_id: int, bot: Bot, data: bytes, filename:
             db.mark_archives_delivered([archive_id])
         except Exception:
             await try_flush_queue_archives(chat_id, bot)
-    elif len(db.archives(chat_id)) >= 3:
-        await try_flush_queue_archives(chat_id, bot, minimum=3)
+    elif len(db.archives(chat_id)) >= RESULTS_PER_ARCHIVE:
+        await try_flush_queue_archives(chat_id, bot, minimum=RESULTS_PER_ARCHIVE)
 
 async def flush_all_archives(chat_id: int, bot: Bot, *, include_sent: bool = False):
     for category in ARCHIVE_LABELS:
@@ -1232,7 +1233,7 @@ async def _process_session_operation(item: dict, bot: Bot, state: FSMContext, *,
             await bot.send_message(chat_id, text)
         except Exception:
             logger.exception("Отчёт проверки не отправлен; ZIP сохранён")
-        await try_flush_queue_archives(chat_id, bot, minimum=3, category=category)
+        await try_flush_queue_archives(chat_id, bot, minimum=RESULTS_PER_ARCHIVE, category=category)
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
         db.remove_item(item["id"])
@@ -1608,7 +1609,16 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
                     await finalize(mig, status, state)
                     return
                 except PasswordHashInvalidError:
-                    await reporter.update("⚠️️ Пароль 2FA из JSON не подошел. Введите вручную:", force=True)
+                    await reporter.update("⚠️ Пароль 2FA из JSON не подошел.", force=True)
+
+            if mig.queue_db_id:
+                stats["skipped"] += 1
+                await reporter.update(
+                    "⏭ Сессия пропущена: требуется пароль 2FA, а в JSON нет подходящего пароля.",
+                    force=True,
+                )
+                await cleanup_migration(mig, state)
+                return
 
             await claim_interactive_migration(mig)
             mig.waiting_2fa = True
@@ -2416,6 +2426,14 @@ async def process_manual_code(message: Message, state: FSMContext):
             except Exception:
                 pass
 
+        if mig.queue_db_id:
+            stats["skipped"] += 1
+            await status.edit_text("⏭ Сессия пропущена: требуется пароль 2FA, а в JSON нет подходящего пароля.")
+            await cleanup_migration(mig, state)
+            if db.count_queue(chat_id) > 0:
+                start_queue_worker(chat_id, message.bot, state)
+            return
+
         mig.waiting_manual_code = False
         mig.waiting_2fa = True
         mig.last_activity = time.time()
@@ -2555,4 +2573,5 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Бот остановлен.")
+
 
