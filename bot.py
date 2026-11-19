@@ -50,6 +50,8 @@ from spam_check import LABELS as SPAM_LABELS, SpamResult, check_spam_status
 from session_devices import LABELS as DEVICE_LABELS, reset_other_sessions
 
 from telethon import TelegramClient
+from telethon.errors.common import TypeNotFoundError
+from telethon.errors.rpcerrorlist import AuthKeyDuplicatedError
 from telethon.errors import (
     AuthKeyUnregisteredError,
     FloodWaitError,
@@ -1652,6 +1654,14 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
     except UserDeactivatedError:
         await reporter.update(f"❌ Аккаунт <code>{mig.phone}</code> деактивирован.", force=True)
         await cleanup_migration(mig)
+    except (TypeNotFoundError, AuthKeyDuplicatedError) as e:
+        logger.warning("Обработка остановлена (%s)", type(e).__name__)
+        reason = (
+            "Telegram отозвал ключ этой сессии."
+            if isinstance(e, AuthKeyDuplicatedError)
+            else "Не удалось прочитать ответ Telegram."
+        )
+        await reporter.update(f"❌ {reason} Задача завершена.", force=True)
     except Exception as e:
         logger.exception("Ошибка process_one_session")
         await reporter.update(f"❌ Сбой обработки: <code>{public_error(e)}</code>", force=True)
