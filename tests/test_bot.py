@@ -743,6 +743,30 @@ class UploadQuotaTests(unittest.IsolatedAsyncioTestCase):
 
 
 class LoginCodeTimeoutTests(unittest.IsolatedAsyncioTestCase):
+    async def test_message_ids_ignore_host_clock_and_stale_or_outgoing_codes(self):
+        async def messages(*args, **kwargs):
+            self.assertEqual(kwargs['min_id'], 100)
+            yield MagicMock(id=103, out=True, raw_text='Code: 33333')
+            yield MagicMock(id=100, out=False, raw_text='Code: 11111')
+            yield MagicMock(id=102, out=False, date=None, raw_text='Code: 22222')
+        code = await bot.poll_login_code(MagicMock(iter_messages=messages),
+                                         MagicMock(skip_requested=False), 9999999999,
+                                         after_id=100, timeout=1)
+        self.assertEqual(code, '22222')
+
+    async def test_capture_last_message_boundary(self):
+        async def messages(*args, **kwargs):
+            yield MagicMock(id=321)
+        self.assertEqual(await bot.latest_login_message_id(
+            MagicMock(iter_messages=messages)), 321)
+
+    async def test_empty_service_chat_boundary(self):
+        async def messages(*args, **kwargs):
+            if False:
+                yield
+        self.assertEqual(await bot.latest_login_message_id(
+            MagicMock(iter_messages=messages)), 0)
+
     async def test_hung_read_is_cancelled_within_total_timeout(self):
         cancelled = asyncio.Event()
         async def messages(*args, **kwargs):
@@ -769,8 +793,8 @@ class LoginCodeTimeoutTests(unittest.IsolatedAsyncioTestCase):
     async def test_stale_code_is_ignored_and_fresh_code_returned(self):
         from datetime import datetime, timezone
         async def messages(*args, **kwargs):
-            yield MagicMock(date=datetime.fromtimestamp(1, timezone.utc), raw_text='Code: 11111')
-            yield MagicMock(date=datetime.fromtimestamp(3, timezone.utc), raw_text='Code: 22222')
+            yield MagicMock(date=datetime.fromtimestamp(1, timezone.utc), out=False, raw_text='Code: 11111')
+            yield MagicMock(date=datetime.fromtimestamp(3, timezone.utc), out=False, raw_text='Code: 22222')
         code = await bot.poll_login_code(MagicMock(iter_messages=messages),
                                          MagicMock(skip_requested=False), 2, timeout=1)
         self.assertEqual(code, '22222')
@@ -803,6 +827,38 @@ class MigrationIsolationTests(unittest.IsolatedAsyncioTestCase):
 
 class QueuePasswordSkipTests(unittest.IsolatedAsyncioTestCase):
     setUp = ArchiveDeliveryTests.setUp
+
+    async def test_sms_delivery_requests_manual_code_without_polling_service_chat(self):
+        from telethon.tl.types.auth import SentCodeTypeSms
+        chat_id = -958
+        self.database.set_clean_mode(chat_id, 1)
+        source = Path(self.tmp.name) / 'sms.session'
+        source.write_bytes(b'offline fixture')
+        self.database.add_queue_item('sms', chat_id, str(source), source.name, None, None)
+        item = self.database.pop_next_item(chat_id)
+        old, new = AsyncMock(), AsyncMock()
+        old.is_connected = MagicMock(return_value=True)
+        new.is_connected = MagicMock(return_value=True)
+        old.get_me.return_value = MagicMock(phone='12345678901')
+        new.send_code_request.return_value = bot.SentCode(
+            type=SentCodeTypeSms(length=5), phone_code_hash='offline')
+        client, state = AsyncMock(), AsyncMock()
+        try:
+            with patch.object(bot, 'get_configured_client', side_effect=[old, new]), \
+                 patch.object(bot, 'latest_login_message_id', new=AsyncMock(return_value=100)), \
+                 patch.object(bot, 'poll_login_code', new=AsyncMock()) as poll:
+                await bot.process_one_session(item, client, state)
+            poll.assert_not_awaited()
+            new.sign_in.assert_not_awaited()
+            state.set_state.assert_awaited_once_with(bot.MigrateStates.waiting_manual_code)
+            mig = bot.current_migration[chat_id]
+            self.assertTrue(mig.waiting_manual_code)
+            self.assertEqual(mig.phone_code_hash, 'offline')
+            self.assertTrue(source.exists())
+        finally:
+            mig = bot.current_migration.get(chat_id)
+            if mig:
+                await bot.cleanup_migration(mig, state)
 
     async def test_auto_queue_skips_missing_and_incorrect_passwords(self):
         for password in (None, 'wrong-password'):
@@ -837,6 +893,7 @@ class QueuePasswordSkipTests(unittest.IsolatedAsyncioTestCase):
         state = AsyncMock()
         before = bot.stats['skipped']
         with patch.object(bot, 'get_configured_client', side_effect=[old, new]), \
+             patch.object(bot, 'latest_login_message_id', new=AsyncMock(return_value=100)), \
              patch.object(bot, 'poll_login_code', new=AsyncMock(return_value='12345')), \
              patch.object(bot, 'claim_interactive_migration', new=AsyncMock()) as claim, \
              patch.object(bot, 'terminate_old_session', new=AsyncMock(return_value=(True, None))) as logout, \
