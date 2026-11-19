@@ -104,6 +104,7 @@ from telethon.tl.types import (
     InputStickerSetID,
     User,
 )
+from telethon.tl.types.auth import SentCode, SentCodeTypeApp
 
 
 # ====================== КОНФИГУРАЦИЯ ======================
@@ -813,15 +814,25 @@ async def claim_interactive_migration(mig: ActiveMigration):
     mig.last_activity = time.time()
 
 
+async def latest_login_message_id(client):
+    async with asyncio.timeout(10):
+        async for message in client.iter_messages(777000, limit=1):
+            return message.id
+    return 0
+
+
 async def poll_login_code(client, mig, request_ts, *, timeout=90.0, read_timeout=10.0,
-                          interval=1.5):
+                          interval=1.5, after_id=None):
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     failures = 0
 
     async def read_code():
-        async for msg in client.iter_messages(777000, limit=3):
-            if msg.date and msg.date.timestamp() >= request_ts:
+        options = {"min_id": after_id} if after_id is not None else {}
+        async for msg in client.iter_messages(777000, limit=20, **options):
+            fresh = (msg.id > after_id if after_id is not None else
+                     msg.date and msg.date.timestamp() >= request_ts)
+            if fresh and not msg.out:
                 code = extract_telegram_code(msg.raw_text or "")
                 if code:
                     return code
@@ -1551,10 +1562,26 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
         mig.new_client = new_client
         await new_client.connect()
 
+        # Capture the boundary before requesting the code. Server message IDs
+        # remain reliable when the host clock differs from Telegram's clock.
+        after_id = await latest_login_message_id(old_client) if auto_mode else None
         request_ts = int(time.time()) - 5
         result = await new_client.send_code_request(phone)
         mig.phone_code_hash = result.phone_code_hash
         mig.last_activity = time.time()
+
+        if auto_mode and isinstance(result, SentCode) and not isinstance(result.type, SentCodeTypeApp):
+            await claim_interactive_migration(mig)
+            mig.waiting_manual_code = True
+            await state.set_state(MigrateStates.waiting_manual_code)
+            await status.edit_text(
+                "📩 Telegram выбрал другой способ подтверждения входа, "
+                "поэтому код в чате 777000 не ожидается.\n"
+                "Если вы получили код по SMS, почте или другим способом, введите его вручную. "
+                "Для отмены нажмите «Отменить всё».",
+                reply_markup=action_kb(can_skip=True),
+            )
+            return
 
         if auto_mode:
             await reporter.update(
@@ -1563,7 +1590,7 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
                 reply_markup=action_kb(can_skip=True),
             )
             try:
-                code = await poll_login_code(old_client, mig, request_ts)
+                code = await poll_login_code(old_client, mig, request_ts, after_id=after_id)
             except TimeoutError:
                 await reporter.update(
                     f"❌ Не удалось дождаться кода от 777000 для <code>{phone}</code>.\n"
