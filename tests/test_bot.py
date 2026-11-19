@@ -952,6 +952,20 @@ class ArchiveGroupingRaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.send_document.await_count, 3)
 
 
+class ProxyDependencyTests(unittest.TestCase):
+    def test_telethon_can_parse_supported_proxies(self):
+        from telethon.network.connection.connection import Connection
+
+        for protocol in ('socks4', 'socks5', 'http'):
+            with self.subTest(protocol=protocol):
+                proxy = bot.parse_session_proxy({'proxy': {
+                    'type': protocol, 'host': '127.0.0.1', 'port': 1080,
+                    'username': 'offline', 'password': 'offline',
+                }})
+                parsed = Connection._parse_proxy(**proxy)
+                self.assertEqual(parsed[1:3], ('127.0.0.1', 1080))
+
+
 class AdminConfigTests(unittest.TestCase):
     def config(self, **kwargs):
         return bot.Settings(_env_file=None, api_id=123, api_hash='offline',
