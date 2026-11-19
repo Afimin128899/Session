@@ -952,6 +952,32 @@ class ArchiveGroupingRaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.send_document.await_count, 3)
 
 
+class AdminConfigTests(unittest.TestCase):
+    def config(self, **kwargs):
+        return bot.Settings(_env_file=None, api_id=123, api_hash='offline',
+                            bot_token='offline', **kwargs)
+
+    def test_environment_admin_ids(self):
+        for value, expected in [('123, 456', {123, 456}), ('123', {123}),
+                                ('', set()), ('[123, 456]', {123, 456})]:
+            with self.subTest(value=value), patch.dict(os.environ, ADMIN_IDS=value):
+                self.assertEqual(self.config().admin_ids, expected)
+
+    def test_dotenv_admin_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = Path(directory) / '.env'
+            env_file.write_text('ADMIN_IDS=123,456\n', encoding='utf-8')
+            with patch.dict(os.environ, {}, clear=True):
+                config = bot.Settings(_env_file=env_file, api_id=123,
+                                      api_hash='offline', bot_token='offline')
+            self.assertEqual(config.admin_ids, {123, 456})
+
+    def test_invalid_admin_id_is_rejected(self):
+        with patch.dict(os.environ, ADMIN_IDS='123,invalid'):
+            with self.assertRaises(ValueError):
+                self.config()
+
+
 class ConcurrencyConfigTests(unittest.TestCase):
     def test_default_queue_limit_is_ten(self):
         config = bot.Settings(_env_file=None, api_id=123, api_hash='offline', bot_token='offline')
@@ -972,4 +998,5 @@ class ConcurrencyConfigTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
 

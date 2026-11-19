@@ -27,7 +27,7 @@ import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Annotated, Any, Dict, List, Optional, Set, Tuple
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -45,7 +45,7 @@ from aiogram.types import (
     Message,
 )
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from spam_check import LABELS as SPAM_LABELS, SpamResult, check_spam_status
 from session_devices import LABELS as DEVICE_LABELS, reset_other_sessions
 
@@ -115,7 +115,7 @@ class Settings(BaseSettings):
     api_hash: str
     bot_token: str
 
-    admin_ids: Set[int] = Field(default_factory=set)
+    admin_ids: Annotated[Set[int], NoDecode] = Field(default_factory=set)
     session_timeout_minutes: int = Field(default=15, ge=1, le=1440)
     max_queue_per_user: int = Field(default=150, ge=1, le=10000)
     default_auto_code: int = 1
@@ -148,6 +148,8 @@ class Settings(BaseSettings):
         if isinstance(v, int):
             return {v}
         if isinstance(v, str):
+            if v.strip().startswith("["):
+                return {int(x) for x in json.loads(v)}
             return {int(x.strip()) for x in v.split(",") if x.strip()}
         if isinstance(v, (list, set, tuple)):
             return {int(x) for x in v}
@@ -2583,5 +2585,6 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Бот остановлен.")
+
 
 
