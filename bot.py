@@ -70,7 +70,7 @@ from telethon.tl.functions.account import (
     UpdateProfileRequest,
     UpdateUsernameRequest,
 )
-from telethon.tl.functions.auth import LogOutRequest, ResetAuthorizationsRequest
+from telethon.tl.functions.auth import LogOutRequest, ResetAuthorizationsRequest, ResendCodeRequest
 from telethon.tl.functions.channels import DeleteChannelRequest, LeaveChannelRequest
 from telethon.tl.functions.contacts import (
     BlockRequest,
@@ -863,6 +863,58 @@ async def poll_login_code(client, mig, request_ts, *, timeout=90.0, read_timeout
     raise TimeoutError("Код от 777000 не получен за отведённое время")
 
 
+def log_code_delivery(mig, result, stage):
+    # Never log the response itself: it contains the login request hash.
+    logger.info("login_delivery task=%s stage=%s response=%s delivery=%s next=%s timeout=%s",
+                mig.id, stage, type(result).__name__, type(getattr(result, 'type', None)).__name__,
+                type(getattr(result, 'next_type', None)).__name__, getattr(result, 'timeout', None))
+
+
+async def wait_automatic_code(old_client, new_client, mig, result, request_ts, after_id, reporter):
+    started = asyncio.get_running_loop().time()
+    delay = result.timeout if isinstance(result, SentCode) else None
+    retry_allowed = (isinstance(result, SentCode) and result.next_type is not None
+                     and isinstance(delay, int) and 0 <= delay <= 120)
+    try:
+        code = await poll_login_code(old_client, mig, request_ts, after_id=after_id,
+                                     timeout=max(90, delay) if retry_allowed else 90)
+        return code, result
+    except TimeoutError:
+        if not retry_allowed or asyncio.get_running_loop().time() - started < delay:
+            raise
+    if mig.skip_requested:
+        raise asyncio.CancelledError
+    await reporter.update("⏳ Код не получен. Выполняю одну разрешённую Telegram повторную отправку.",
+                          force=True)
+    async with asyncio.timeout(20):
+        result = await new_client(ResendCodeRequest(mig.phone, mig.phone_code_hash),
+                                  flood_sleep_threshold=0)
+    log_code_delivery(mig, result, 'resend')
+    if not isinstance(result, SentCode) or not result.phone_code_hash:
+        raise ValueError("Telegram не подтвердил повторную отправку кода")
+    mig.phone_code_hash = result.phone_code_hash
+    mig.last_activity = time.time()
+    if not isinstance(result.type, SentCodeTypeApp):
+        return None, result
+    await reporter.update("📩 Telegram указал доставку в приложение. Проверяю новые сообщения 777000.",
+                          force=True)
+    code = await poll_login_code(old_client, mig, request_ts, after_id=after_id)
+    return code, result
+
+
+async def prompt_manual_delivery(mig, state, status):
+    await claim_interactive_migration(mig)
+    mig.waiting_manual_code = True
+    await state.set_state(MigrateStates.waiting_manual_code)
+    await status.edit_text(
+        "📩 Telegram выбрал другой способ подтверждения входа. "
+        "Код в чате 777000 не ожидается.\n"
+        "Если вы получили код по SMS, почте или другим способом, введите его вручную. "
+        "Если кода нет, отмените задачу: бот не может гарантировать его доставку.",
+        reply_markup=action_kb(can_skip=True),
+    )
+
+
 async def cleanup_migration(mig: ActiveMigration, state: Optional[FSMContext] = None):
     chat_id = mig.chat_id
     active_migrations.pop(mig.id, None)
@@ -1566,35 +1618,40 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
         # remain reliable when the host clock differs from Telegram's clock.
         after_id = await latest_login_message_id(old_client) if auto_mode else None
         request_ts = int(time.time()) - 5
-        result = await new_client.send_code_request(phone)
+        async with asyncio.timeout(30):
+            result = await new_client.send_code_request(phone)
+        log_code_delivery(mig, result, 'request')
         mig.phone_code_hash = result.phone_code_hash
         mig.last_activity = time.time()
 
         if auto_mode and isinstance(result, SentCode) and not isinstance(result.type, SentCodeTypeApp):
-            await claim_interactive_migration(mig)
-            mig.waiting_manual_code = True
-            await state.set_state(MigrateStates.waiting_manual_code)
-            await status.edit_text(
-                "📩 Telegram выбрал другой способ подтверждения входа, "
-                "поэтому код в чате 777000 не ожидается.\n"
-                "Если вы получили код по SMS, почте или другим способом, введите его вручную. "
-                "Для отмены нажмите «Отменить всё».",
-                reply_markup=action_kb(can_skip=True),
-            )
+            await prompt_manual_delivery(mig, state, status)
             return
 
         if auto_mode:
             await reporter.update(
-                f"📩 Код запрошен на <code>{phone}</code>. Опрашиваю 777000...",
+                "📩 Запрос входа принят. Проверяю, появится ли код в 777000…",
                 force=True,
                 reply_markup=action_kb(can_skip=True),
             )
             try:
-                code = await poll_login_code(old_client, mig, request_ts, after_id=after_id)
-            except TimeoutError:
+                code, result = await wait_automatic_code(
+                    old_client, new_client, mig, result, request_ts, after_id, reporter)
+                if code is None:
+                    await prompt_manual_delivery(mig, state, status)
+                    return
+            except FloodWaitError as exc:
                 await reporter.update(
-                    f"❌ Не удалось дождаться кода от 777000 для <code>{phone}</code>.\n"
-                    "Истёк таймаут или недоступно чтение сообщений. Попробуйте /manual.",
+                    f"⏳ Telegram ограничил запросы входа. Повторите через {exc.seconds} с. "
+                    "Исходная сессия сохранена.", force=True)
+                await cleanup_migration(mig)
+                return
+            except TimeoutError:
+                logger.warning("login_delivery task=%s stage=wait outcome=timeout", mig.id)
+                await reporter.update(
+                    "❌ Код в 777000 не получен за отведённое время. "
+                    "Доставка не подтверждена или чтение чата недоступно.\n"
+                    f"Исходная сессия сохранена. Номер задачи: <code>{mig.id}</code>.",
                     force=True,
                 )
                 await cleanup_migration(mig)
