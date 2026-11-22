@@ -48,6 +48,7 @@ from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from spam_check import LABELS as SPAM_LABELS, SpamResult, check_spam_status
 from session_devices import LABELS as DEVICE_LABELS, reset_other_sessions
+from source_activity import prepare_source_session
 
 from telethon import TelegramClient
 from telethon.errors.common import TypeNotFoundError
@@ -1551,6 +1552,28 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
         mig.old_client = old_client
 
         await reporter.update(
+            "🔄 Подключаю исходный аккаунт: проверяю состояние и включаю статус онлайн…",
+            force=True,
+        )
+        if mig.skip_requested:
+            raise asyncio.CancelledError
+        try:
+            await prepare_source_session(old_client)
+        except FloodWaitError as exc:
+            await reporter.update(
+                f"⏳ Telegram просит подождать {exc.seconds} с перед подготовкой аккаунта. "
+                "Исходная сессия сохранена.", force=True)
+            return
+        except TimeoutError:
+            await reporter.update(
+                "❌ Не удалось подготовить исходное подключение за 20 с. "
+                "Новый код не запрошен; исходная сессия сохранена.", force=True)
+            return
+        if mig.skip_requested:
+            raise asyncio.CancelledError
+        logger.info("source_prepared task=%s", mig.id)
+
+        await reporter.update(
             f"📱 Сессия: <code>{phone}</code>\n"
             f"💻 Имитация: <code>{mig.fingerprint['device']}</code>\n"
             f"⏳ Запрашиваю код подтверждения...",
@@ -2612,6 +2635,7 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Бот остановлен.")
+
 
 
 
