@@ -27,7 +27,7 @@ import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -45,14 +45,11 @@ from aiogram.types import (
     Message,
 )
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from spam_check import LABELS as SPAM_LABELS, SpamResult, check_spam_status
 from session_devices import LABELS as DEVICE_LABELS, reset_other_sessions
-from source_activity import prepare_source_session
 
 from telethon import TelegramClient
-from telethon.errors.common import TypeNotFoundError
-from telethon.errors.rpcerrorlist import AuthKeyDuplicatedError
 from telethon.errors import (
     AuthKeyUnregisteredError,
     FloodWaitError,
@@ -105,7 +102,6 @@ from telethon.tl.types import (
     InputStickerSetID,
     User,
 )
-from telethon.tl.types.auth import SentCode, SentCodeTypeApp
 
 
 # ====================== КОНФИГУРАЦИЯ ======================
@@ -117,11 +113,11 @@ class Settings(BaseSettings):
     api_hash: str
     bot_token: str
 
-    admin_ids: Annotated[Set[int], NoDecode] = Field(default_factory=set)
+    admin_ids: Set[int] = Field(default_factory=set)
     session_timeout_minutes: int = Field(default=15, ge=1, le=1440)
     max_queue_per_user: int = Field(default=150, ge=1, le=10000)
     default_auto_code: int = 1
-    concurrent_workers_per_chat: int = Field(default=10, ge=1, le=10)
+    concurrent_workers_per_chat: int = Field(default=3, ge=1, le=3)
     concurrent_dialogs_per_session: int = Field(default=10, ge=1, le=10)
     db_file: str = "sessions_v100x.db"
 
@@ -134,7 +130,7 @@ class Settings(BaseSettings):
     @field_validator("concurrent_workers_per_chat", mode="before")
     @classmethod
     def cap_session_workers(cls, value):
-        return min(int(value), 10)
+        return min(int(value), 3)
 
     @field_validator("concurrent_dialogs_per_session", mode="before")
     @classmethod
@@ -150,8 +146,6 @@ class Settings(BaseSettings):
         if isinstance(v, int):
             return {v}
         if isinstance(v, str):
-            if v.strip().startswith("["):
-                return {int(x) for x in json.loads(v)}
             return {int(x.strip()) for x in v.split(",") if x.strip()}
         if isinstance(v, (list, set, tuple)):
             return {int(x) for x in v}
@@ -474,7 +468,6 @@ queue_paused: Dict[int, bool] = {}
 queue_current_items: Dict[int, str] = {}
 archive_locks: Dict[int, asyncio.Lock] = {}
 MAX_RESULT_BYTES = 45 * 1024 * 1024
-RESULTS_PER_ARCHIVE = 10
 ARCHIVE_LABELS = {"accounts": "", **{"spam_" + k: v for k, v in SPAM_LABELS.items()},
                   **{"devices_" + k: v for k, v in DEVICE_LABELS.items()}}
 
@@ -488,7 +481,7 @@ async def flush_queue_archives(chat_id: int, bot: Bot, *, include_sent: bool = F
             batch = []
             used_names = set()
             with zipfile.ZipFile(output, "w", zipfile.ZIP_STORED) as bundle:
-                for archive_id, name, data in archives[:RESULTS_PER_ARCHIVE]:
+                for archive_id, name, data in archives[:3]:
                     with zipfile.ZipFile(io.BytesIO(data)) as account:
                         members = [entry for entry in account.infolist()
                                    if not entry.is_dir() and Path(entry.filename).suffix.lower() in {".session", ".json"}]
@@ -544,8 +537,8 @@ async def deliver_account_archive(chat_id: int, bot: Bot, data: bytes, filename:
             db.mark_archives_delivered([archive_id])
         except Exception:
             await try_flush_queue_archives(chat_id, bot)
-    elif len(db.archives(chat_id)) >= RESULTS_PER_ARCHIVE:
-        await try_flush_queue_archives(chat_id, bot, minimum=RESULTS_PER_ARCHIVE)
+    elif len(db.archives(chat_id)) >= 3:
+        await try_flush_queue_archives(chat_id, bot, minimum=3)
 
 async def flush_all_archives(chat_id: int, bot: Bot, *, include_sent: bool = False):
     for category in ARCHIVE_LABELS:
@@ -815,25 +808,15 @@ async def claim_interactive_migration(mig: ActiveMigration):
     mig.last_activity = time.time()
 
 
-async def latest_login_message_id(client):
-    async with asyncio.timeout(10):
-        async for message in client.iter_messages(777000, limit=1):
-            return message.id
-    return 0
-
-
 async def poll_login_code(client, mig, request_ts, *, timeout=90.0, read_timeout=10.0,
-                          interval=1.5, after_id=None):
+                          interval=1.5):
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     failures = 0
 
     async def read_code():
-        options = {"min_id": after_id} if after_id is not None else {}
-        async for msg in client.iter_messages(777000, limit=20, **options):
-            fresh = (msg.id > after_id if after_id is not None else
-                     msg.date and msg.date.timestamp() >= request_ts)
-            if fresh and not msg.out:
+        async for msg in client.iter_messages(777000, limit=3):
+            if msg.date and msg.date.timestamp() >= request_ts:
                 code = extract_telegram_code(msg.raw_text or "")
                 if code:
                     return code
@@ -1249,7 +1232,7 @@ async def _process_session_operation(item: dict, bot: Bot, state: FSMContext, *,
             await bot.send_message(chat_id, text)
         except Exception:
             logger.exception("Отчёт проверки не отправлен; ZIP сохранён")
-        await try_flush_queue_archives(chat_id, bot, minimum=RESULTS_PER_ARCHIVE, category=category)
+        await try_flush_queue_archives(chat_id, bot, minimum=3, category=category)
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
         db.remove_item(item["id"])
@@ -1552,28 +1535,6 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
         mig.old_client = old_client
 
         await reporter.update(
-            "🔄 Подключаю исходный аккаунт: проверяю состояние и включаю статус онлайн…",
-            force=True,
-        )
-        if mig.skip_requested:
-            raise asyncio.CancelledError
-        try:
-            await prepare_source_session(old_client)
-        except FloodWaitError as exc:
-            await reporter.update(
-                f"⏳ Telegram просит подождать {exc.seconds} с перед подготовкой аккаунта. "
-                "Исходная сессия сохранена.", force=True)
-            return
-        except TimeoutError:
-            await reporter.update(
-                "❌ Не удалось подготовить исходное подключение за 20 с. "
-                "Новый код не запрошен; исходная сессия сохранена.", force=True)
-            return
-        if mig.skip_requested:
-            raise asyncio.CancelledError
-        logger.info("source_prepared task=%s", mig.id)
-
-        await reporter.update(
             f"📱 Сессия: <code>{phone}</code>\n"
             f"💻 Имитация: <code>{mig.fingerprint['device']}</code>\n"
             f"⏳ Запрашиваю код подтверждения...",
@@ -1585,26 +1546,10 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
         mig.new_client = new_client
         await new_client.connect()
 
-        # Capture the boundary before requesting the code. Server message IDs
-        # remain reliable when the host clock differs from Telegram's clock.
-        after_id = await latest_login_message_id(old_client) if auto_mode else None
         request_ts = int(time.time()) - 5
         result = await new_client.send_code_request(phone)
         mig.phone_code_hash = result.phone_code_hash
         mig.last_activity = time.time()
-
-        if auto_mode and isinstance(result, SentCode) and not isinstance(result.type, SentCodeTypeApp):
-            await claim_interactive_migration(mig)
-            mig.waiting_manual_code = True
-            await state.set_state(MigrateStates.waiting_manual_code)
-            await status.edit_text(
-                "📩 Telegram выбрал другой способ подтверждения входа, "
-                "поэтому код в чате 777000 не ожидается.\n"
-                "Если вы получили код по SMS, почте или другим способом, введите его вручную. "
-                "Для отмены нажмите «Отменить всё».",
-                reply_markup=action_kb(can_skip=True),
-            )
-            return
 
         if auto_mode:
             await reporter.update(
@@ -1613,7 +1558,7 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
                 reply_markup=action_kb(can_skip=True),
             )
             try:
-                code = await poll_login_code(old_client, mig, request_ts, after_id=after_id)
+                code = await poll_login_code(old_client, mig, request_ts)
             except TimeoutError:
                 await reporter.update(
                     f"❌ Не удалось дождаться кода от 777000 для <code>{phone}</code>.\n"
@@ -1663,16 +1608,7 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
                     await finalize(mig, status, state)
                     return
                 except PasswordHashInvalidError:
-                    await reporter.update("⚠️ Пароль 2FA из JSON не подошел.", force=True)
-
-            if mig.queue_db_id:
-                stats["skipped"] += 1
-                await reporter.update(
-                    "⏭ Сессия пропущена: требуется пароль 2FA, а в JSON нет подходящего пароля.",
-                    force=True,
-                )
-                await cleanup_migration(mig, state)
-                return
+                    await reporter.update("⚠️️ Пароль 2FA из JSON не подошел. Введите вручную:", force=True)
 
             await claim_interactive_migration(mig)
             mig.waiting_2fa = True
@@ -1706,14 +1642,6 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
     except UserDeactivatedError:
         await reporter.update(f"❌ Аккаунт <code>{mig.phone}</code> деактивирован.", force=True)
         await cleanup_migration(mig)
-    except (TypeNotFoundError, AuthKeyDuplicatedError) as e:
-        logger.warning("Обработка остановлена (%s)", type(e).__name__)
-        reason = (
-            "Telegram отозвал ключ этой сессии."
-            if isinstance(e, AuthKeyDuplicatedError)
-            else "Не удалось прочитать ответ Telegram."
-        )
-        await reporter.update(f"❌ {reason} Задача завершена.", force=True)
     except Exception as e:
         logger.exception("Ошибка process_one_session")
         await reporter.update(f"❌ Сбой обработки: <code>{public_error(e)}</code>", force=True)
@@ -2488,14 +2416,6 @@ async def process_manual_code(message: Message, state: FSMContext):
             except Exception:
                 pass
 
-        if mig.queue_db_id:
-            stats["skipped"] += 1
-            await status.edit_text("⏭ Сессия пропущена: требуется пароль 2FA, а в JSON нет подходящего пароля.")
-            await cleanup_migration(mig, state)
-            if db.count_queue(chat_id) > 0:
-                start_queue_worker(chat_id, message.bot, state)
-            return
-
         mig.waiting_manual_code = False
         mig.waiting_2fa = True
         mig.last_activity = time.time()
@@ -2635,7 +2555,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Бот остановлен.")
-
-
-
 
