@@ -876,6 +876,7 @@ class QueuePasswordSkipTests(unittest.IsolatedAsyncioTestCase):
         self.database.add_queue_item('password', chat_id, str(source), source.name, password, None)
         item = self.database.pop_next_item(chat_id)
         old = MagicMock()
+        old.side_effect = AsyncMock(return_value=True)
         old.connect = AsyncMock()
         old.disconnect = AsyncMock()
         old.is_user_authorized = AsyncMock(return_value=True)
@@ -883,7 +884,14 @@ class QueuePasswordSkipTests(unittest.IsolatedAsyncioTestCase):
         new = MagicMock()
         new.connect = AsyncMock()
         new.disconnect = AsyncMock()
-        new.send_code_request = AsyncMock(return_value=MagicMock(phone_code_hash='fixture'))
+        async def send_after_preparation(phone):
+            from telethon.tl.functions.account import UpdateStatusRequest
+            from telethon.tl.functions.updates import GetStateRequest
+            self.assertEqual(old.call_count, 2)
+            self.assertIsInstance(old.call_args_list[0].args[0], GetStateRequest)
+            self.assertIsInstance(old.call_args_list[1].args[0], UpdateStatusRequest)
+            return MagicMock(phone_code_hash='fixture')
+        new.send_code_request = AsyncMock(side_effect=send_after_preparation)
         errors = [bot.SessionPasswordNeededError(request=None)]
         if password:
             errors.append(bot.PasswordHashInvalidError(request=None) if skipped else None)
@@ -1069,5 +1077,6 @@ class ConcurrencyConfigTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
 
 
