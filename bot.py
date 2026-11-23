@@ -48,6 +48,8 @@ from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from spam_check import LABELS as SPAM_LABELS, SpamResult, check_spam_status
 from session_devices import LABELS as DEVICE_LABELS, reset_other_sessions
+from login_diagnostics import runtime_version, delivery_description
+from telethon.tl.types.auth import SentCode, SentCodeTypeApp
 
 from telethon import TelegramClient
 from telethon.errors import (
@@ -1547,13 +1549,33 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
         await new_client.connect()
 
         request_ts = int(time.time()) - 5
-        result = await new_client.send_code_request(phone)
+        async with asyncio.timeout(30):
+            result = await new_client.send_code_request(phone)
         mig.phone_code_hash = result.phone_code_hash
         mig.last_activity = time.time()
 
+        delivery = delivery_description(result)
+        logger.info("login_request task=%s response=%s delivery=%s next=%s timeout=%s",
+                    mig.id, type(result).__name__, type(getattr(result, 'type', None)).__name__,
+                    type(getattr(result, 'next_type', None)).__name__, getattr(result, 'timeout', None))
+        if auto_mode and isinstance(result, SentCode) and not isinstance(result.type, SentCodeTypeApp):
+            await claim_interactive_migration(mig)
+            mig.waiting_manual_code = True
+            await state.set_state(MigrateStates.waiting_manual_code)
+            await status.edit_text(
+                f"📩 Способ подтверждения, выбранный Telegram: <b>{delivery}</b>.\n"
+                "Код в 777000 не ожидается. Если вы получили код, введите его вручную. "
+                "Если его нет — отмените задачу.\n"
+                f"Задача: <code>{mig.id}</code>. Версия: delivery-diag-1.",
+                reply_markup=action_kb(can_skip=True),
+            )
+            return
+
         if auto_mode:
             await reporter.update(
-                f"📩 Код запрошен на <code>{phone}</code>. Опрашиваю 777000...",
+                f"📩 Telegram указал доставку: <b>{delivery}</b>.\n"
+                "Проверяю появление кода в 777000; доставка пока не подтверждена.\n"
+                f"Задача: <code>{mig.id}</code>. Версия: delivery-diag-1.",
                 force=True,
                 reply_markup=action_kb(can_skip=True),
             )
@@ -1747,6 +1769,11 @@ async def queue_worker(chat_id: int, bot: Bot, state: FSMContext):
 # ====================== ХЕНДЛЕРЫ ======================
 
 router = Router()
+
+
+@router.message(Command("version"))
+async def cmd_version(message: Message):
+    await message.answer(runtime_version(__file__))
 
 
 @router.message(Command("archives"))
@@ -2531,6 +2558,7 @@ async def main():
         await bot.set_my_commands([
             BotCommand(command="start", description="Главное меню"),
             BotCommand(command="status", description="Статус очереди"),
+            BotCommand(command="version", description="Версия запущенного бота"),
             BotCommand(command="archives", description="Получить сохранённые архивы"),
             BotCommand(command="pause", description="Пауза очереди"),
             BotCommand(command="resume", description="Продолжить очередь"),
@@ -2555,4 +2583,5 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Бот остановлен.")
+
 
