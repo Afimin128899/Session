@@ -1,0 +1,11 @@
+.git
+.env
+.env.*
+sessions/
+**/*.session*
+**/*.zip
+**/*.sqlite*
+**/*.db
+.venv
+**/__pycache__
+.pytest_cache

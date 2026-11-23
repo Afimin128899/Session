@@ -10,7 +10,7 @@ def runtime_version(source):
     commit = commit[:12] if commit and all(c in '0123456789abcdefABCDEF' for c in commit) else 'неизвестен'
     digest = hashlib.sha256(Path(source).read_bytes()).hexdigest()[:12]
     service = html.escape(os.environ.get('RAILWAY_SERVICE_NAME', 'локальный запуск')[:80])
-    return (f'Версия: <code>delivery-diag-1</code>\nКоммит: <code>{commit}</code>\n'
+    return (f'Версия: <code>cleanup-separate-2</code>\nКоммит: <code>{commit}</code>\n'
             f'Код: <code>{digest}</code>\nСервис: <code>{service}</code>')
 
 
@@ -27,3 +27,4 @@ def delivery_description(result):
         'SentCodeTypeFragmentSms': 'получение кода через Fragment',
     }
     return labels.get(kind, 'другой способ подтверждения (' + html.escape(kind) + ')')
+

@@ -170,6 +170,8 @@ class ArchiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
     async def check_parallel_queue(self, mode, handler):
         chat_id = -920
         self.database.set_clean_mode(chat_id, mode)
+        bot.confirmed_modes[chat_id] = mode
+        bot.queue_paused[chat_id] = False
         for index in range(5):
             self.database.add_queue_item(str(index), chat_id, 'unused', str(index), None, None)
         started = []
@@ -218,6 +220,8 @@ class ArchiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_pause_drains_active_sessions_without_starting_more(self):
         chat_id = -922
         self.database.set_clean_mode(chat_id, 2)
+        bot.confirmed_modes[chat_id] = 2
+        bot.queue_paused[chat_id] = False
         for index in range(5):
             self.database.add_queue_item(str(index), chat_id, 'unused', str(index), None, None)
         started = []
@@ -248,6 +252,8 @@ class ArchiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancelling_supervisor_stops_all_three_sessions(self):
         chat_id = -921
         self.database.set_clean_mode(chat_id, 2)
+        bot.confirmed_modes[chat_id] = 2
+        bot.queue_paused[chat_id] = False
         for index in range(3):
             self.database.add_queue_item(str(index), chat_id, 'unused', str(index), None, None)
         active = set()
@@ -278,6 +284,8 @@ class ArchiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as root:
             database = bot.Database(str(Path(root) / 'queue.sqlite'))
             database.set_clean_mode(chat_id, 2)
+            bot.confirmed_modes[chat_id] = 2
+            bot.queue_paused[chat_id] = False
             for index in range(3):
                 database.add_queue_item(str(index), chat_id, 'unused', str(index), None, None)
 
@@ -292,43 +300,31 @@ class ArchiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(bot, 'db', database), patch.object(bot, 'process_fast_clean_session', side_effect=process), patch.object(bot.asyncio, 'sleep', new=AsyncMock()):
                 await bot.queue_worker(chat_id, client, AsyncMock())
             self.assertEqual(database.count_outstanding(chat_id), 0)
-        client.send_document.assert_awaited_once()
-        with zipfile.ZipFile(io.BytesIO(client.send_document.call_args.kwargs['document'].data)) as archive:
-            self.assertEqual(len(archive.namelist()), 4)
+        self.assertEqual(client.send_document.await_count, 2)
+        for call in client.send_document.call_args_list:
+            with zipfile.ZipFile(io.BytesIO(call.kwargs['document'].data)) as archive:
+                self.assertEqual(len(archive.namelist()), 2)
 
-    async def test_three_accounts_are_sent_as_flat_session_json_files(self):
+    async def test_each_queued_account_is_sent_immediately_as_flat_files(self):
         client = AsyncMock()
         chat_id = -901
-        inner = io.BytesIO()
-        with zipfile.ZipFile(inner, 'w') as archive:
-            archive.writestr('account.session', b'offline fixture')
-            archive.writestr('account.json', b'{"id": 123}')
-        for _ in range(3):
-            await bot.deliver_account_archive(
-                chat_id, client, inner.getvalue(), 'same.zip', 'Ready', queued=True,
-            )
-        # Third result triggers delivery without waiting for the rest of the queue.
-        await bot.flush_queue_archives(chat_id, client)
-        client.send_document.assert_awaited_once()
-        document = client.send_document.call_args.kwargs['document']
-        self.assertEqual(document.filename, 'accounts.zip')
-        with zipfile.ZipFile(io.BytesIO(document.data)) as bundle:
-            self.assertEqual(bundle.namelist(), [
-                'account.session', 'account.json', 'account_2.session', 'account_2.json',
-                'account_3.session', 'account_3.json',
-            ])
-            for name in bundle.namelist():
-                expected = b'offline fixture' if name.endswith('.session') else b'{"id": 123}'
-                self.assertEqual(bundle.read(name), expected)
+        for index in range(3):
+            await bot.deliver_account_archive(chat_id, client, self.account_zip(), 'same.zip', 'Ready', queued=True)
+            self.assertEqual(client.send_document.await_count, index + 1)
+        for call in client.send_document.call_args_list:
+            with zipfile.ZipFile(io.BytesIO(call.kwargs['document'].data)) as archive:
+                self.assertEqual(len(archive.namelist()), 2)
+                self.assertTrue(all('/' not in name for name in archive.namelist()))
         self.assertEqual(self.database.archives(chat_id), [])
+        self.assertEqual(len(self.database.archives(chat_id, include_sent=True)), 3)
         await bot.flush_queue_archives(chat_id, client)
-        client.send_document.assert_awaited_once()
+        self.assertEqual(client.send_document.await_count, 3)
 
     async def test_send_failure_keeps_results_for_retry(self):
         client = AsyncMock()
         chat_id = -902
-        await bot.deliver_account_archive(chat_id, client, self.account_zip(), 'one.zip', 'Ready', queued=True)
         client.send_document.side_effect = OSError('offline')
+        await bot.deliver_account_archive(chat_id, client, self.account_zip(), 'one.zip', 'Ready', queued=True)
         with self.assertRaises(OSError):
             await bot.flush_queue_archives(chat_id, client)
         self.assertEqual(len(self.database.archives(chat_id)), 1)
@@ -336,11 +332,11 @@ class ArchiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
         await bot.flush_queue_archives(chat_id, client)
         self.assertEqual(self.database.archives(chat_id), [])
 
-    async def test_nine_accounts_send_three_batches_before_queue_finishes(self):
+    async def test_nine_accounts_send_as_each_finishes(self):
         client = AsyncMock()
         for index in range(9):
             await bot.deliver_account_archive(-908, client, self.account_zip(), f'{index}.zip', 'Ready', queued=True)
-            self.assertEqual(client.send_document.await_count, (index + 1) // 3)
+            self.assertEqual(client.send_document.await_count, index + 1)
         self.assertEqual(self.database.archives(-908), [])
         self.assertEqual(len(self.database.archives(-908, include_sent=True)), 9)
 
@@ -372,7 +368,8 @@ class ArchiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
         client = AsyncMock()
         client.send_message.side_effect = OSError('offline')
         await bot.deliver_account_archive(-906, client, self.account_zip(), 'one.zip', 'Ready', queued=True)
-        self.assertEqual(len(self.database.archives(-906)), 1)
+        self.assertEqual(len(self.database.archives(-906, include_sent=True)), 1)
+        self.assertEqual(self.database.archives(-906), [])
         await bot.flush_queue_archives(-906, client)
         client.send_document.assert_awaited_once()
 
@@ -480,6 +477,7 @@ class InterfaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('cancel_all', callbacks)
 
     async def test_pause_resume_controls(self):
+        bot.db.set_clean_mode(-201, 1)
         message = AsyncMock()
         message.chat.id = -201
         call = AsyncMock()
@@ -511,6 +509,7 @@ class InterfaceTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(task, return_exceptions=True)
 
     async def test_worker_start_is_deduplicated(self):
+        bot.db.set_clean_mode(-202, 1)
         hold = asyncio.Event()
         async def fake_worker(chat_id, message_bot, state):
             await hold.wait()
@@ -604,6 +603,7 @@ class InterfaceTests(unittest.IsolatedAsyncioTestCase):
 class LifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_polling_failure_releases_resources(self):
         client = AsyncMock()
+        client.get_webhook_info.return_value.url = ''
         dispatcher = AsyncMock()
         dispatcher.include_router = lambda router: None
         dispatcher.start_polling.side_effect = RuntimeError('polling failed')
@@ -830,20 +830,20 @@ class FixedBatchTests(unittest.IsolatedAsyncioTestCase):
 class ArchiveGroupingRaceTests(unittest.IsolatedAsyncioTestCase):
     setUp = ArchiveDeliveryTests.setUp
     account_zip = ArchiveDeliveryTests.account_zip
-    async def test_parallel_completions_only_send_full_groups_until_final_flush(self):
+    async def test_parallel_completions_deliver_every_ready_result(self):
         client = AsyncMock()
         await asyncio.gather(*(bot.deliver_account_archive(
             -951, client, self.account_zip(), f'{i}.zip', 'Ready', queued=True)
             for i in range(7)))
-        self.assertEqual(client.send_document.await_count, 2)
-        self.assertEqual(len(self.database.archives(-951)), 1)
+        self.assertEqual(client.send_document.await_count, 7)
+        self.assertEqual(len(self.database.archives(-951)), 0)
         for call in client.send_document.call_args_list:
             with zipfile.ZipFile(io.BytesIO(call.kwargs['document'].data)) as archive:
-                self.assertEqual(len(archive.namelist()), 6)
+                self.assertEqual(len(archive.namelist()), 2)
                 self.assertTrue(all('/' not in n and Path(n).suffix in ('.session', '.json')
                                     for n in archive.namelist()))
         await bot.flush_queue_archives(-951, client)
-        self.assertEqual(client.send_document.await_count, 3)
+        self.assertEqual(client.send_document.await_count, 7)
 
 
 class ConcurrencyConfigTests(unittest.TestCase):
@@ -857,3 +857,4 @@ class ConcurrencyConfigTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

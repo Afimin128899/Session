@@ -113,6 +113,8 @@ class DevicePipelineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_mode_four_dispatches_to_device_reset(self):
         self.database.set_clean_mode(-992, 4)
+        bot.confirmed_modes[-992] = 4
+        bot.queue_paused[-992] = False
         self.database.add_queue_item('dispatch', -992, 'unused', 'unused', None, None)
         async def process(item, *args):
             self.database.remove_item(item['id'])
@@ -127,3 +129,4 @@ class DevicePipelineTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

@@ -3,7 +3,7 @@
 Telegram Session Migrator & Bulk Cleaner v100x+ Extreme Industrial
 + Полная очистка и миграция сессий Telethon
 + Исправлено экранирование спецсимволов HTML для Telegram API
-+ Гарантированное завершение старой сессии через LogOutRequest
++ Миграция сохраняет исходную авторизацию; очистка и завершение других сеансов — отдельно
 + Мультипоточная обработка очередей с использованием SQLite
 """
 
@@ -14,6 +14,7 @@ import html
 import io
 import json
 import logging
+import os
 import random
 import re
 import shutil
@@ -27,7 +28,7 @@ import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, Annotated
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -44,8 +45,8 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
 )
-from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, field_validator, AliasChoices
+from pydantic_settings import BaseSettings, SettingsConfigDict, NoDecode
 from spam_check import LABELS as SPAM_LABELS, SpamResult, check_spam_status
 from session_devices import LABELS as DEVICE_LABELS, reset_other_sessions
 from login_diagnostics import runtime_version, delivery_description
@@ -109,16 +110,16 @@ from telethon.tl.types import (
 # ====================== КОНФИГУРАЦИЯ ======================
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(env_file=None, extra="ignore", populate_by_name=True)
 
     api_id: int
     api_hash: str
     bot_token: str
 
-    admin_ids: Set[int] = Field(default_factory=set)
+    admin_ids: Annotated[Set[int], NoDecode] = Field(default_factory=set, validation_alias=AliasChoices("ALLOWED_IDS", "ADMIN_IDS"))
     session_timeout_minutes: int = Field(default=15, ge=1, le=1440)
     max_queue_per_user: int = Field(default=150, ge=1, le=10000)
-    default_auto_code: int = 1
+    default_auto_code: int = 2
     concurrent_workers_per_chat: int = Field(default=3, ge=1, le=3)
     concurrent_dialogs_per_session: int = Field(default=10, ge=1, le=10)
     db_file: str = "sessions_v100x.db"
@@ -148,7 +149,7 @@ class Settings(BaseSettings):
         if isinstance(v, int):
             return {v}
         if isinstance(v, str):
-            return {int(x.strip()) for x in v.split(",") if x.strip()}
+            return {int(x) for x in v.strip("[] ").split(",") if x.strip()}
         if isinstance(v, (list, set, tuple)):
             return {int(x) for x in v}
         return set()
@@ -167,6 +168,14 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+if os.getenv("DATA_DIR"):
+    data_root = Path(os.environ["DATA_DIR"]).resolve()
+    data_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not os.getenv("DB_FILE"):
+        settings.db_file = str(data_root / "sessions_v100x.db")
+    runtime_temp = data_root / "tmp"
+    runtime_temp.mkdir(exist_ok=True, mode=0o700)
+    tempfile.tempdir = str(runtime_temp)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -176,8 +185,32 @@ logging.basicConfig(
 logger = logging.getLogger("IndustrialWiper")
 
 
+class SafeLogFilter(logging.Filter):
+    def filter(self, record):
+        message = record.getMessage()
+        if record.exc_info:
+            message += " [" + record.exc_info[0].__name__ + "]"
+            record.exc_info = None
+            record.exc_text = None
+        message = re.sub(r"(?<!\w)\+?\d{7,15}(?!\w)", "<номер скрыт>", message)
+        record.msg, record.args = message, ()
+        return True
+
+
+logger.addFilter(SafeLogFilter())
+logging.getLogger("telethon").setLevel(logging.CRITICAL)
+
+
+
+def mask_phone(phone):
+    value = str(phone or "")
+    return value[:2] + "***" + value[-2:] if len(value) > 4 else "***"
+
+
 def public_error(exc: BaseException) -> str:
     """Return a safe, non-sensitive error label for Telegram messages."""
+    if isinstance(exc, FloodWaitError):
+        return f"Telegram требует подождать {exc.seconds} с; повторите после окончания срока."
     name = type(exc).__name__
     return html.escape(name.removesuffix("Error") or "ошибка")
 
@@ -363,16 +396,17 @@ class Database:
             return cur.fetchone()[0]
 
     def set_clean_mode(self, chat_id: int, mode: int):
+        confirmed_modes.pop(chat_id, None)
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("INSERT OR REPLACE INTO settings (chat_id, auto_mode) VALUES (?, ?)", (chat_id, mode))
             conn.commit()
 
-    def get_clean_mode(self, chat_id: int, default: int = 1) -> int:
+    def get_clean_mode(self, chat_id: int, default: Optional[int] = None) -> int:
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.cursor()
             cur.execute("SELECT auto_mode FROM settings WHERE chat_id = ?", (chat_id,))
             row = cur.fetchone()
-            return int(row[0]) if row is not None else default
+            return int(row[0]) if row is not None else (settings.default_auto_code if default is None else default)
 
     def compact_menu(self, chat_id: int) -> bool:
         with sqlite3.connect(self.db_path) as conn:
@@ -539,8 +573,8 @@ async def deliver_account_archive(chat_id: int, bot: Bot, data: bytes, filename:
             db.mark_archives_delivered([archive_id])
         except Exception:
             await try_flush_queue_archives(chat_id, bot)
-    elif len(db.archives(chat_id)) >= 3:
-        await try_flush_queue_archives(chat_id, bot, minimum=3)
+    else:
+        await try_flush_queue_archives(chat_id, bot)
 
 async def flush_all_archives(chat_id: int, bot: Bot, *, include_sent: bool = False):
     for category in ARCHIVE_LABELS:
@@ -719,6 +753,7 @@ def main_menu_kb(chat_id: int) -> InlineKeyboardMarkup:
         queue_button = InlineKeyboardButton(text="Пауза очереди", callback_data="pause_queue")
 
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Очистить аккаунт", callback_data="select_cleanup")],
         [InlineKeyboardButton(text="Вход по сессии", callback_data="btn_session_login")],
         [InlineKeyboardButton(text="Новая сессия", callback_data="btn_new_session")],
         [InlineKeyboardButton(text="Проверка спамблока", callback_data="check_spam")],
@@ -788,7 +823,7 @@ async def terminate_old_session(old_client: Optional[TelegramClient]) -> Tuple[b
 
         except Exception as e:
             last_error = str(e)
-            logger.warning(f"Ошибка при выходе из старой сессии (попытка {attempt}/3): {e}")
+            logger.warning(f"Ошибка при выходе из старой сессии (попытка {attempt}/3): {type(e).__name__}")
             try:
                 await old_client.disconnect()
             except Exception:
@@ -1078,16 +1113,20 @@ async def deep_clean_account(client: TelegramClient, reporter: StatusReporter) -
     try:
         await client(UpdateProfileRequest(first_name=".", last_name="", about=""))
         report.profile_cleared = True
+    except FloodWaitError:
+        raise
     except Exception as e:
-        logger.warning(f"Ошибка сброса профиля: {e}")
+        logger.warning(f"Ошибка сброса профиля: {type(e).__name__}")
 
     try:
         me = await client.get_me()
         if getattr(me, "username", None):
             await client(UpdateUsernameRequest(username=""))
             report.username_cleared = True
+    except FloodWaitError:
+        raise
     except Exception as e:
-        logger.warning(f"Ошибка удаления username: {e}")
+        logger.warning(f"Ошибка удаления username: {type(e).__name__}")
 
     # 2. Аватарки
     await reporter.update(f"🧹 Удаление фото профиля...\n{render_progress_bar(2, 10)}")
@@ -1100,8 +1139,10 @@ async def deep_clean_account(client: TelegramClient, reporter: StatusReporter) -
             ]
             await client(DeletePhotosRequest(id=input_photos))
             report.photos_deleted = len(input_photos)
+    except FloodWaitError:
+        raise
     except Exception as e:
-        logger.warning(f"Ошибка удаления фото: {e}")
+        logger.warning(f"Ошибка удаления фото: {type(e).__name__}")
 
     # 3. Privacy Lockdown
     await reporter.update(f"🔒 Сброс приватности...\n{render_progress_bar(3, 10)}")
@@ -1114,22 +1155,28 @@ async def deep_clean_account(client: TelegramClient, reporter: StatusReporter) -
         await client(SetPrivacyRequest(key=InputPrivacyKeyPhoneCall(), rules=disallow))
         await client(SetPrivacyRequest(key=InputPrivacyKeyChatInvite(), rules=disallow))
         report.privacy_secured = True
+    except FloodWaitError:
+        raise
     except Exception as e:
-        logger.warning(f"Ошибка параметров приватности: {e}")
+        logger.warning(f"Ошибка параметров приватности: {type(e).__name__}")
 
     # 4. Платежные реквизиты
     try:
         await client(ClearSavedInfoRequest(credentials=True, info=True))
         report.payments_cleared = True
+    except FloodWaitError:
+        raise
     except Exception as e:
-        logger.debug(f"Платежные данные отсутствуют: {e}")
+        logger.debug(f"Платежные данные отсутствуют: {type(e).__name__}")
 
     # 5. Установка TTL аккаунта (30 дней)
     try:
         await client(SetAccountTTLRequest(ttl=AccountDaysTTL(days=30)))
         report.ttl_set_30d = True
+    except FloodWaitError:
+        raise
     except Exception as e:
-        logger.debug(f"TTL не обновлен: {e}")
+        logger.debug(f"TTL не обновлен: {type(e).__name__}")
 
     # 6. Контакты и облачный поисковый граф
     await reporter.update(f"🧹 Стирание контактов...\n{render_progress_bar(4, 10)}")
@@ -1141,8 +1188,10 @@ async def deep_clean_account(client: TelegramClient, reporter: StatusReporter) -
             report.contacts_deleted = len(users)
         await client(ResetSavedRequest())
         report.saved_contacts_reset = True
+    except FloodWaitError:
+        raise
     except Exception as e:
-        logger.warning(f"Ошибка удаления контактов: {e}")
+        logger.warning(f"Ошибка удаления контактов: {type(e).__name__}")
 
     # 7. Папки чатов
     await reporter.update(f"🧹 Удаление папок...\n{render_progress_bar(5, 10)}")
@@ -1153,8 +1202,10 @@ async def deep_clean_account(client: TelegramClient, reporter: StatusReporter) -
             if fid is not None and fid != 0:
                 await client(UpdateDialogFilterRequest(id=fid, filter=None))
                 report.folders_deleted += 1
+    except FloodWaitError:
+        raise
     except Exception as e:
-        logger.warning(f"Ошибка папок: {e}")
+        logger.warning(f"Ошибка папок: {type(e).__name__}")
 
     # 8. Стикеры и эмодзи-паки
     try:
@@ -1163,23 +1214,31 @@ async def deep_clean_account(client: TelegramClient, reporter: StatusReporter) -
             try:
                 await client(UninstallStickerSetRequest(stickerset=InputStickerSetID(id=sset.id, access_hash=sset.access_hash)))
                 report.stickers_removed += 1
+            except FloodWaitError:
+                raise
             except Exception:
                 pass
+    except FloodWaitError:
+        raise
     except Exception as e:
-        logger.warning(f"Ошибка стикеров: {e}")
+        logger.warning(f"Ошибка стикеров: {type(e).__name__}")
 
     # 9. Черновики и Избранное
     try:
         await client(ClearAllDraftsRequest())
         report.drafts_cleared = True
+    except FloodWaitError:
+        raise
     except Exception:
         pass
 
     try:
         await client(DeleteHistoryRequest(peer="me", max_id=0, just_clear=False, revoke=True))
         report.saved_messages_cleared = True
+    except FloodWaitError:
+        raise
     except Exception as e:
-        logger.warning(f"Очистка Избранного: {e}")
+        logger.warning(f"Очистка Избранного: {type(e).__name__}")
 
     # 10. Диалоги, каналы, группы и боты
     await reporter.update(f"🧹 Тотальная зачистка чатов...\n{render_progress_bar(7, 10)}", force=True)
@@ -1188,6 +1247,8 @@ async def deep_clean_account(client: TelegramClient, reporter: StatusReporter) -
     try:
         await client(ResetWebAuthorizationsRequest())
         report.web_auths_reset = True
+    except FloodWaitError:
+        raise
     except Exception as e:
         pass
 
@@ -1308,7 +1369,7 @@ async def _process_session_operation(item: dict, bot: Bot, state: FSMContext, *,
             await bot.send_message(chat_id, text)
         except Exception:
             logger.exception("Отчёт проверки не отправлен; ZIP сохранён")
-        await try_flush_queue_archives(chat_id, bot, minimum=3, category=category)
+        await try_flush_queue_archives(chat_id, bot, category=category)
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
         db.remove_item(item["id"])
@@ -1385,19 +1446,24 @@ async def process_fast_clean_session(item: dict, bot: Bot, state: Optional[FSMCo
             zf.write(final_session, arcname=f"{phone_label}.session")
             zf.write(meta_file, arcname=f"{phone_label}.json")
 
+        def outcome(value):
+            return "подтверждено" if value else "не подтверждено"
+
         caption = (
-            f"⚡ <b>Сессия очищена по стандарту v100x+</b>\n\n"
-            f"📞 Телефон: <code>{phone_label}</code>\n"
-            f"🆔 ID: <code>{check.user_id}</code>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"🗑 Стерто диалогов: <b>{clean_report.dialogs_purged}</b>\n"
-            f"⚠️ Не очищено: <b>{clean_report.dialogs_failed}</b>\n"
-            f"📇 Контакты и поисковый топ: <b>Очищены</b>\n"
-            f"👑 Удалено каналов создателя: <b>{clean_report.channels_deleted}</b>\n"
-            f"💳 Платежные данные: <b>Уничтожены</b>\n"
-            f"⏳ TTL аккаунта: <b>30 дней</b>\n"
-            f"🔒 Privacy Lockdown: <b>Включен</b>\n"
-            f"🌐 Сессии: <b>{'Сброшены' if clean_report.sessions_reset else 'Пропущены (&lt; 24ч)'}</b>"
+            "<b>Обработка очистки завершена</b>\n\n"
+            f"Телефон: <code>{mask_phone(phone_label)}</code>\n"
+            f"Профиль: {outcome(clean_report.profile_cleared)}\n"
+            f"Удалено фото: {clean_report.photos_deleted}\n"
+            f"Удалено контактов: {clean_report.contacts_deleted}\n"
+            f"Сброс сохранённых контактов: {outcome(clean_report.saved_contacts_reset)}\n"
+            f"Удалено диалогов: {clean_report.dialogs_purged}; ошибок: {clean_report.dialogs_failed}\n"
+            f"Удалено каналов создателя: {clean_report.channels_deleted}\n"
+            f"Платёжные данные: {outcome(clean_report.payments_cleared)}\n"
+            f"Черновики: {outcome(clean_report.drafts_cleared)}\n"
+            f"Избранное: {outcome(clean_report.saved_messages_cleared)}\n"
+            f"Срок автоудаления 30 дней: {outcome(clean_report.ttl_set_30d)}\n"
+            f"Изменение приватности: {outcome(clean_report.privacy_secured)}\n"
+            f"Завершение других сеансов: {outcome(clean_report.sessions_reset)}"
         )
 
         await deliver_account_archive(
@@ -1408,6 +1474,8 @@ async def process_fast_clean_session(item: dict, bot: Bot, state: Optional[FSMCo
         stats["success"] += 1
 
     except Exception as e:
+        if isinstance(e, FloodWaitError):
+            queue_paused[chat_id] = True
         logger.exception("Ошибка в fast pipeline")
         stats["failed"] += 1
         await reporter.update(
@@ -1433,8 +1501,6 @@ async def create_metadata(client: TelegramClient, phone: str, fp: dict[str, str]
     me: User = await client.get_me()
     ts = int(time.time())
     return {
-        "app_id": settings.api_id,
-        "app_hash": settings.api_hash,
         "device": fp["device"],
         "sdk": fp["sys"],
         "app_version": fp["app"],
@@ -1467,27 +1533,6 @@ async def finalize(mig: ActiveMigration, message: Message, state: Optional[FSMCo
         if not client or not await client.is_user_authorized():
             raise AuthKeyUnregisteredError("Клиент не авторизован")
 
-        # Дополнительная попытка деавторизации, если она еще не прошла
-        if mig.old_client and not mig.old_session_terminated:
-            success, err = await terminate_old_session(mig.old_client)
-            mig.old_session_terminated = success
-            mig.old_session_error = err
-            mig.old_client = None
-
-        # Очищаем аккаунт на новой активной сессии
-        clean_info = await deep_clean_account(client, reporter)
-
-        # Сброс остальных сессий
-        try:
-            await client(ResetAuthorizationsRequest())
-            clean_info.sessions_reset = True
-        except FreshResetAuthorisationForbiddenError:
-            clean_info.sessions_reset = False
-            clean_info.sessions_reset_warning = "Сессия свежая (&lt; 24 ч, лимит Telegram)"
-        except Exception as e:
-            clean_info.sessions_reset = False
-            clean_info.sessions_reset_warning = public_error(e)
-
         metadata = await create_metadata(client, phone, mig.fingerprint)
         await client.disconnect()
         mig.new_client = None
@@ -1509,7 +1554,6 @@ async def finalize(mig: ActiveMigration, message: Message, state: Optional[FSMCo
             zf.write(meta_file, arcname=f"{phone}.json")
 
         data = zip_path.read_bytes()
-        reset_status = "сброшены" if clean_info.sessions_reset else "не сброшены"
 
         if mig.is_new_session:
             old_line = ""
@@ -1518,16 +1562,12 @@ async def finalize(mig: ActiveMigration, message: Message, state: Optional[FSMCo
         else:
             old_line = "Старая сессия: не завершена\n"
 
-        ttl_line = "\nАвтоудаление аккаунта: 30 дней без активности" if clean_info.ttl_set_30d else ""
 
         caption = (
             "<b>Сессия готова</b>\n\n"
-            f"<code>{html.escape(phone)}</code> · ID <code>{metadata['id']}</code>\n"
+            f"<code>{html.escape(mask_phone(phone))}</code> · ID <code>{metadata['id']}</code>\n"
             f"{old_line}"
-            f"Удалено диалогов: {clean_info.dialogs_purged}\n"
-            f"Не очищено: {clean_info.dialogs_failed}\n"
-            f"Другие устройства: {reset_status}"
-            f"{ttl_line}"
+            "Данные аккаунта сохранены. Другие сеансы не завершались."
         )
 
         await deliver_account_archive(
@@ -1611,7 +1651,7 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
         mig.old_client = old_client
 
         await reporter.update(
-            f"📱 Сессия: <code>{phone}</code>\n"
+            f"📱 Сессия: <code>{mask_phone(phone)}</code>\n"
             f"💻 Имитация: <code>{mig.fingerprint['device']}</code>\n"
             f"⏳ Запрашиваю код подтверждения...",
             force=True,
@@ -1685,7 +1725,7 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
             mig.waiting_manual_code = True
             await state.set_state(MigrateStates.waiting_manual_code)
             await status.edit_text(
-                f"📩 Код отправлен на <code>{phone}</code>\n\nОтправьте код подтверждения в чат:",
+                f"📩 Код отправлен на <code>{mask_phone(phone)}</code>\n\nОтправьте код подтверждения в чат:",
                 reply_markup=action_kb(can_skip=True),
             )
             return
@@ -1699,11 +1739,6 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
         try:
             await new_client.sign_in(phone=phone, code=code, phone_code_hash=mig.phone_code_hash)
 
-            # Вход подтвержден: деавторизуем старую сессию
-            success, err = await terminate_old_session(mig.old_client)
-            mig.old_session_terminated = success
-            mig.old_session_error = err
-            mig.old_client = None
 
             await finalize(mig, status, state)
 
@@ -1713,10 +1748,6 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
                 try:
                     await new_client.sign_in(password=mig.auto_2fa_password)
 
-                    success, err = await terminate_old_session(mig.old_client)
-                    mig.old_session_terminated = success
-                    mig.old_session_error = err
-                    mig.old_client = None
 
                     await finalize(mig, status, state)
                     return
@@ -1750,10 +1781,10 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
         if not mig.skip_requested:
             raise
     except PhoneNumberBannedError:
-        await reporter.update(f"❌ Номер <code>{mig.phone}</code> заблокирован Telegram.", force=True)
+        await reporter.update(f"❌ Номер <code>{mask_phone(mig.phone)}</code> заблокирован Telegram.", force=True)
         await cleanup_migration(mig)
     except UserDeactivatedError:
-        await reporter.update(f"❌ Аккаунт <code>{mig.phone}</code> деактивирован.", force=True)
+        await reporter.update(f"❌ Аккаунт <code>{mask_phone(mig.phone)}</code> деактивирован.", force=True)
         await cleanup_migration(mig)
     except Exception as e:
         logger.exception("Ошибка process_one_session")
@@ -1769,6 +1800,10 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
 def start_queue_worker(chat_id: int, bot: Bot, state: FSMContext) -> Optional[asyncio.Task]:
     """Start at most one queue supervisor per chat."""
     if queue_paused.get(chat_id, False):
+        return None
+    mode = db.get_clean_mode(chat_id, settings.default_auto_code)
+    if mode in DESTRUCTIVE_PLANS and confirmed_modes.get(chat_id) != mode:
+        queue_paused[chat_id] = True
         return None
     existing = queue_worker_tasks.get(chat_id)
     if existing and not existing.done():
@@ -1826,6 +1861,9 @@ async def queue_worker(chat_id: int, bot: Bot, state: FSMContext):
             paused = queue_paused.get(chat_id, False)
             waiting = active and (active.waiting_2fa or active.waiting_manual_code)
             mode = db.get_clean_mode(chat_id, settings.default_auto_code)
+            if mode in DESTRUCTIVE_PLANS and confirmed_modes.get(chat_id) != mode:
+                queue_paused[chat_id] = True
+                paused = True
             limit = settings.concurrent_workers_per_chat if mode in (1, 2, 3, 4) else 1
             # Drain the old mode before switching (manual mode owns one FSM).
             if not paused and not waiting and (not running or running_mode == mode):
@@ -1862,6 +1900,55 @@ async def queue_worker(chat_id: int, bot: Bot, state: FSMContext):
 router = Router()
 
 
+async def private_access(handler, event, data):
+    message = event.message if isinstance(event, CallbackQuery) else event
+    if message and message.chat.type == "private" and event.from_user and event.from_user.id in settings.admin_ids:
+        return await handler(event, data)
+    logger.warning("Доступ отклонён: нужен личный чат и ID отправителя в ALLOWED_IDS.")
+    if isinstance(event, CallbackQuery):
+        await event.answer("Доступ запрещён", show_alert=True)
+
+
+confirmed_modes: Dict[int, int] = {}
+DESTRUCTIVE_PLANS = {
+    2: ("<b>Подтвердите глубокую очистку</b>\n\n"
+        "Будут сброшены профиль и username, удалены фото, контакты, папки, стикеры, черновики, Избранное и история диалогов; "
+        "бот выйдет из групп и каналов, удалит каналы, созданные аккаунтом, заблокирует ботов, очистит платёжные данные. "
+        "Настройки приватности изменятся, срок автоудаления аккаунта будет установлен в 30 дней. "
+        "Будут завершены веб-авторизации и другие сеансы. Эти действия необратимы.\n"
+        "Действие применяется ко всем ожидающим сессиям в очереди."),
+    4: ("<b>Подтвердите завершение других сеансов</b>\n\n"
+        "Будут завершены все другие авторизации каждого аккаунта в очереди. Загруженная авторизация сохранится. "
+        "Данные аккаунта удаляться не будут."),
+}
+
+
+def operation_confirmation_kb(mode: int):
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Подтверждаю действия", callback_data=f"confirm_operation:{mode}"),
+        InlineKeyboardButton(text="Назад", callback_data="main_menu"),
+    ]])
+
+
+@router.callback_query(F.data.startswith("confirm_operation:"))
+async def cb_confirm_operation(call: CallbackQuery, state: FSMContext):
+    mode = int(call.data.rsplit(":", 1)[1])
+    chat_id = call.message.chat.id
+    if mode not in DESTRUCTIVE_PLANS or db.get_clean_mode(chat_id, settings.default_auto_code) != mode:
+        await call.answer("Режим изменился; запросите подтверждение заново", show_alert=True)
+        return
+    confirmed_modes[chat_id] = mode
+    queue_paused[chat_id] = False
+    start_queue_worker(chat_id, call.bot, state)
+    await call.answer("Действия подтверждены")
+    await call.message.edit_text(menu_text(chat_id), reply_markup=main_menu_kb(chat_id))
+
+
+router.message.outer_middleware(private_access)
+router.callback_query.outer_middleware(private_access)
+
+
+
 @router.message(Command("version"))
 async def cmd_version(message: Message):
     await message.answer(runtime_version(__file__))
@@ -1885,7 +1972,7 @@ def menu_text(chat_id: int) -> str:
     pending = db.count_queue(chat_id)
     description = ("Завершение других сеансов с сохранением загруженной сессии." if mode == 4 else
                    "Проверка через @SpamBot и ZIP по категориям." if mode == 3 else
-                   "Миграция завершает старую сессию. Очистка удаляет данные аккаунта.")
+                   "Миграция сохраняет старую авторизацию и данные. Очистка удаляет данные аккаунта.")
     if db.compact_menu(chat_id):
         return (
             "<b>Меню</b>\n"
@@ -1952,6 +2039,11 @@ async def cb_pause_queue(call: CallbackQuery):
 @router.callback_query(F.data == "resume_queue")
 async def cb_resume_queue(call: CallbackQuery, state: FSMContext):
     chat_id = call.message.chat.id
+    mode = db.get_clean_mode(chat_id, settings.default_auto_code)
+    if mode in DESTRUCTIVE_PLANS:
+        await call.answer()
+        await call.message.answer(DESTRUCTIVE_PLANS[mode], reply_markup=operation_confirmation_kb(mode))
+        return
     queue_paused[chat_id] = False
     start_queue_worker(chat_id, call.bot, state)
     await call.answer("Очередь продолжена")
@@ -1971,6 +2063,10 @@ async def cmd_pause(message: Message):
 @router.message(Command("resume"))
 async def cmd_resume(message: Message, state: FSMContext):
     chat_id = message.chat.id
+    mode = db.get_clean_mode(chat_id, settings.default_auto_code)
+    if mode in DESTRUCTIVE_PLANS:
+        await message.answer(DESTRUCTIVE_PLANS[mode], reply_markup=operation_confirmation_kb(mode))
+        return
     queue_paused[chat_id] = False
     start_queue_worker(chat_id, message.bot, state)
     await message.answer("Очередь продолжена.", reply_markup=main_menu_kb(chat_id))
@@ -1993,7 +2089,7 @@ async def cb_help(call: CallbackQuery):
         f"Лимит очереди: {db.get_upload_limit(call.message.chat.id)} сессий.\n\n"
         "/start — меню, /status — очередь, /cancel — отменить всё.\n"
         "Открытие меню не прерывает обработку.\n"
-        "Миграция завершает старую сессию. Очистка удаляет данные аккаунта.",
+        "Миграция сохраняет старую авторизацию и данные. Очистка удаляет данные аккаунта.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="Меню", callback_data="main_menu"),
         ]]),
@@ -2171,8 +2267,24 @@ async def cb_session_login(call: CallbackQuery):
     await call.message.answer(
         "Отправьте файл <code>.session</code> или ZIP-архив с сессиями и парными JSON.\n"
         "Файлы будут обработаны в выбранном режиме.\n"
-        "Миграция завершает старую сессию. Очистка удаляет данные аккаунта.",
+        "Миграция сохраняет старую авторизацию и данные. Очистка удаляет данные аккаунта.",
         reply_markup=main_menu_kb(call.message.chat.id),
+    )
+
+
+@router.callback_query(F.data == "select_cleanup")
+async def cb_select_cleanup(call: CallbackQuery):
+    chat_id = call.message.chat.id
+    worker = queue_worker_tasks.get(chat_id)
+    if (worker and not worker.done()) or any(m.chat_id == chat_id for m in active_migrations.values()):
+        await call.answer("Дождитесь завершения текущей операции", show_alert=True)
+        return
+    db.set_clean_mode(chat_id, 2)
+    queue_paused[chat_id] = True
+    await call.answer("Выбрана очистка")
+    await call.message.answer(
+        DESTRUCTIVE_PLANS[2] + "\n\nЗагрузите .session или ZIP с парными JSON. После загрузки нажмите «Проверить и запустить», затем подтвердите действия.",
+        reply_markup=queued_review_kb() if db.count_queue(chat_id) else main_menu_kb(chat_id),
     )
 
 
@@ -2326,7 +2438,7 @@ async def process_phone(message: Message, state: FSMContext):
     phone = raw
     await state.update_data(pending_phone=phone)
     await message.answer(
-        f"Номер: <code>{phone}</code>\nНажмите «Получить код», чтобы запросить код в Telegram.",
+        f"Номер: <code>{mask_phone(phone)}</code>\nНажмите «Получить код», чтобы запросить код в Telegram.",
         reply_markup=login_code_kb(),
     )
 
@@ -2334,7 +2446,7 @@ async def process_phone(message: Message, state: FSMContext):
 async def start_new_session_code(message: Message, state: FSMContext, phone: str):
     chat_id = message.chat.id
     mig_id = str(uuid.uuid4())[:8]
-    status = await message.answer(f"⏳ Запрашиваю код для <code>{phone}</code>...")
+    status = await message.answer(f"⏳ Запрашиваю код для <code>{mask_phone(phone)}</code>...")
     mig = ActiveMigration(
         id=mig_id,
         chat_id=chat_id,
@@ -2356,7 +2468,7 @@ async def start_new_session_code(message: Message, state: FSMContext, phone: str
         stats["started"] += 1
 
         await state.set_state(MigrateStates.waiting_manual_code)
-        await status.edit_text(f"📩 Код отправлен на <code>{phone}</code>. Отправьте его:", reply_markup=action_kb(can_skip=False))
+        await status.edit_text(f"📩 Код отправлен на <code>{mask_phone(phone)}</code>. Отправьте его:", reply_markup=action_kb(can_skip=False))
 
     except FloodWaitError as e:
         await status.edit_text(f"❌ Telegram FloodWait: подождите {e.seconds} с.")
@@ -2470,6 +2582,7 @@ async def process_document_upload(message: Message, state: FSMContext):
     stats["started"] += added_count
     total_queue = db.count_queue(chat_id)
     queue_paused[chat_id] = True
+    confirmed_modes.pop(chat_id, None)
 
     await message.answer(
         f"Сессий добавлено: <b>{added_count}</b>\n"
@@ -2479,7 +2592,7 @@ async def process_document_upload(message: Message, state: FSMContext):
          if db.get_clean_mode(chat_id) == 4 else
          "Проверка через @SpamBot; при сбое бот будет разблокирован для повторной попытки.\n"
          if db.get_clean_mode(chat_id) == 3 else
-         "Миграция завершает старую сессию. Быстрая очистка удаляет данные аккаунта.\n")
+         "Миграция сохраняет старую авторизацию и данные. Быстрая очистка удаляет данные аккаунта.\n")
         + "Обработка начнётся после вашего подтверждения.",
         reply_markup=queued_review_kb(),
     )
@@ -2502,11 +2615,6 @@ async def process_manual_code(message: Message, state: FSMContext):
     try:
         await mig.new_client.sign_in(phone=mig.phone, code=code, phone_code_hash=mig.phone_code_hash)
 
-        # Вход подтвержден: деавторизуем старую сессию
-        success, err = await terminate_old_session(mig.old_client)
-        mig.old_session_terminated = success
-        mig.old_session_error = err
-        mig.old_client = None
 
         mig.waiting_manual_code = False
         await state.clear()
@@ -2520,10 +2628,6 @@ async def process_manual_code(message: Message, state: FSMContext):
             try:
                 await mig.new_client.sign_in(password=mig.auto_2fa_password)
 
-                success, err = await terminate_old_session(mig.old_client)
-                mig.old_session_terminated = success
-                mig.old_session_error = err
-                mig.old_client = None
 
                 mig.waiting_manual_code = False
                 await state.clear()
@@ -2559,11 +2663,6 @@ async def process_2fa(message: Message, state: FSMContext):
     try:
         await mig.new_client.sign_in(password=password)
 
-        # 2FA подтвержден: деавторизуем старую сессию
-        success, err = await terminate_old_session(mig.old_client)
-        mig.old_session_terminated = success
-        mig.old_session_error = err
-        mig.old_client = None
 
         mig.waiting_2fa = False
         await state.clear()
@@ -2646,6 +2745,12 @@ async def main():
 
     watchdog = asyncio.create_task(watchdog_task(bot))
     try:
+        logger.warning("Запуск: проверка подключения к Bot API.")
+        identity = await bot.get_me()
+        webhook = await bot.get_webhook_info()
+        if webhook.url:
+            logger.error("Установлен webhook: отключите его перед polling. Адрес webhook скрыт.")
+            raise RuntimeError("Для токена установлен webhook; отключите его перед polling. URL скрыт.")
         await bot.set_my_commands([
             BotCommand(command="start", description="Главное меню"),
             BotCommand(command="status", description="Статус очереди"),
@@ -2660,7 +2765,7 @@ async def main():
             BotCommand(command="id", description="Мой Telegram ID"),
             BotCommand(command="cancel", description="Отменить обработку"),
         ])
-        logger.info("Бот запущен")
+        logger.warning("Бот @%s подключён. Polling; разрешённых ID: %d.", identity.username, len(settings.admin_ids))
         await dp.start_polling(bot, close_bot_session=False)
     finally:
         watchdog.cancel()
@@ -2674,6 +2779,7 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Бот остановлен.")
+
 
 
 
