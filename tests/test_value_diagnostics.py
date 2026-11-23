@@ -170,3 +170,20 @@ def test_invalid_proxy_is_rejected_before_allocating_client():
         with pytest.raises(ProxyConfigError):
             bot.get_configured_client('unused', {}, {'proxy_type':'unknown', 'addr':'private', 'port':1080})
     create.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fast_clean_does_not_fall_back_to_direct_connection(tmp_path):
+    source = tmp_path / 'original.session'
+    source.write_bytes(b'offline fixture')
+    work = tmp_path / 'work'
+    work.mkdir()
+    database = bot.Database(str(tmp_path / 'queue.sqlite'))
+    item = {'id':'fast_fixture', 'chat_id':123, 'original_name':'fixture.session', 'file_path':str(source),
+            'proxy_json':'{"proxy_type":"socks5","addr":"private-address","port":1080}', 'auto_2fa':None}
+    with patch.object(bot, 'db', database), patch.object(bot.tempfile, 'mkdtemp', return_value=str(work)), \
+         patch.object(bot, 'verify_proxy_alive', new=AsyncMock(return_value=False)), \
+         patch.object(bot, 'get_configured_client') as create:
+        await bot.process_fast_clean_session(item, AsyncMock())
+    create.assert_not_called()
+    assert not work.exists() and source.exists()

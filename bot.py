@@ -1468,8 +1468,12 @@ async def process_fast_clean_session(item: dict, bot: Bot, state: Optional[FSMCo
     if proxy_dict:
         is_alive = await verify_proxy_alive(proxy_dict)
         if not is_alive:
-            logger.warning(f"Прокси {proxy_dict.get('addr')} недоступен, откат к fallback.")
-            proxy_dict = None
+            stats["failed"] += 1
+            await reporter.update("Прокси недоступен; очистка и подключение без него не выполнялись.", force=True)
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            if item.get("id"):
+                db.remove_item(item["id"])
+            return
 
     fp = get_random_fingerprint()
     client = get_configured_client(str(session_copy.with_suffix("")), fp, proxy_dict)
