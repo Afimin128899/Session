@@ -120,8 +120,8 @@ async def test_cleanup_button_selects_mode_but_does_not_process():
     assert '30 дней' in call.message.answer.call_args.args[0]
 
 
-def test_cleanup_is_default_and_has_own_main_menu_button():
-    assert bot.settings.default_auto_code == 2
+def test_combined_is_default_and_cleanup_has_own_main_menu_button():
+    assert bot.settings.default_auto_code == 5
     with patch.object(bot.db, 'get_clean_mode', return_value=2):
         buttons = [button for row in bot.main_menu_kb(123).inline_keyboard for button in row]
     assert any(button.callback_data == 'select_cleanup' for button in buttons)
