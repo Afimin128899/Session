@@ -820,6 +820,23 @@ async def login_message_boundary(client):
     return messages[0].id if messages else 0
 
 
+async def login_message_boundaries(client):
+    boundaries = {777000: await login_message_boundary(client)}
+    async with asyncio.timeout(10):
+        try:
+            # A displayed phone number is not necessarily the Telegram user ID.
+            peer = await client.get_input_entity('+42777')
+        except ValueError:
+            logger.info('code_source alias=42777 outcome=unavailable')
+            return boundaries
+        peer_id = getattr(peer, 'user_id', None)
+        if not isinstance(peer_id, int) or peer_id in boundaries:
+            return boundaries
+        messages = await client.get_messages(peer, limit=1)
+        boundaries[peer_id] = messages[0].id if messages else 0
+    return boundaries
+
+
 async def poll_login_code(client, mig, request_ts, *, timeout=90.0, read_timeout=10.0,
                           interval=1.5, after_id=None):
     loop = asyncio.get_running_loop()
@@ -828,24 +845,52 @@ async def poll_login_code(client, mig, request_ts, *, timeout=90.0, read_timeout
     reads = 0
     fresh_ids = set()
     unrecognized_ids = set()
+    boundaries = after_id if isinstance(after_id, dict) else {777000: after_id}
 
     def stopped(reason, detail):
         logger.warning("code_wait task=%s outcome=%s reads=%s fresh=%s unrecognized=%s",
                        mig.id, reason, reads, len(fresh_ids), len(unrecognized_ids))
         return LoginCodeTimeout(detail)
 
-    async def read_code():
-        options = {"min_id": after_id} if after_id is not None else {}
-        async for msg in client.iter_messages(777000, limit=20, **options):
-            fresh = (msg.id > after_id if after_id is not None else
+    async def read_peer(peer_id, boundary):
+        options = {"min_id": boundary} if boundary is not None else {}
+        async for msg in client.iter_messages(peer_id, limit=20, **options):
+            fresh = (msg.id > boundary if boundary is not None else
                      msg.date and msg.date.timestamp() >= request_ts)
             if fresh and getattr(msg, 'out', False) is not True:
-                fresh_ids.add(msg.id)
+                fresh_ids.add((peer_id, msg.id))
                 code = extract_telegram_code(msg.raw_text or "")
                 if code:
                     return code
-                unrecognized_ids.add(msg.id)
+                unrecognized_ids.add((peer_id, msg.id))
         return None
+
+    async def read_code():
+        if len(boundaries) == 1:
+            peer_id, boundary = next(iter(boundaries.items()))
+            return await read_peer(peer_id, boundary)
+        # Read concurrently: one unavailable source must not hide a code in the other.
+        tasks = [asyncio.create_task(read_peer(peer, boundary))
+                 for peer, boundary in boundaries.items()]
+        completed = 0
+        errors = []
+        try:
+            for task in asyncio.as_completed(tasks):
+                try:
+                    code = await task
+                    completed += 1
+                    if code:
+                        return code
+                except (TimeoutError, ConnectionError, OSError, ValueError, FloodWaitError) as exc:
+                    errors.append(exc)
+            if not completed and errors:
+                raise errors[0]
+            return None
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     while loop.time() < deadline:
         if mig.skip_requested:
@@ -862,20 +907,20 @@ async def poll_login_code(client, mig, request_ts, *, timeout=90.0, read_timeout
         except FloodWaitError as exc:
             delay = exc.seconds + 1
             if delay >= deadline - loop.time():
-                raise stopped('flood_wait', f"Telegram ограничил чтение 777000: подождите {exc.seconds} с.") from exc
+                raise stopped('flood_wait', f"Telegram ограничил чтение служебных чатов: подождите {exc.seconds} с.") from exc
             await asyncio.sleep(delay)
             continue
         except (TimeoutError, ConnectionError, OSError) as exc:
             failures += 1
-            logger.warning("Ошибка чтения 777000 (%s/3): %s", failures, type(exc).__name__)
+            logger.warning("Ошибка чтения служебных чатов (%s/3): %s", failures, type(exc).__name__)
             if failures >= 3:
-                raise stopped('read_failed', "Не удалось прочитать 777000 после трёх попыток подключения.") from exc
+                raise stopped('read_failed', "Не удалось прочитать служебные чаты после трёх попыток подключения.") from exc
         await asyncio.sleep(min(interval, max(0, deadline - loop.time())))
     if not reads:
-        raise stopped('read_failed', "Чтение 777000 не завершилось за отведённое время.")
+        raise stopped('read_failed', "Чтение служебных чатов не завершилось за отведённое время.")
     if fresh_ids:
-        raise stopped('unrecognized', "В 777000 появились новые сообщения, но код входа не распознан.")
-    raise stopped('no_new_messages', "Чат 777000 доступен, но новых входящих сообщений после запроса нет.")
+        raise stopped('unrecognized', "В служебных чатах появились новые сообщения, но код входа не распознан.")
+    raise stopped('no_new_messages', "В прочитанных служебных чатах новых входящих сообщений после запроса нет.")
 
 
 async def cleanup_migration(mig: ActiveMigration, state: Optional[FSMContext] = None):
@@ -1582,7 +1627,7 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
         after_id = None
         if auto_mode:
             try:
-                after_id = await login_message_boundary(old_client)
+                after_id = await login_message_boundaries(old_client)
             except FloodWaitError as exc:
                 await reporter.update(
                     f"⏳ Telegram ограничил чтение исходной сессии: подождите {exc.seconds} с. "
@@ -1619,7 +1664,7 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
         if auto_mode:
             await reporter.update(
                 f"📩 Telegram указал доставку: <b>{delivery}</b>.\n"
-                "Проверяю появление кода в 777000; доставка пока не подтверждена.\n"
+                "Проверяю 777000 и доступный чат +42777; доставка пока не подтверждена.\n"
                 f"Задача: <code>{mig.id}</code>. Версия: delivery-diag-1.",
                 force=True,
                 reply_markup=action_kb(can_skip=True),

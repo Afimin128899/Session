@@ -9,6 +9,44 @@ class ReaderTests(unittest.IsolatedAsyncioTestCase):
     def migration(self):
         return bot.ActiveMigration(id='reader-test', chat_id=1)
 
+    async def test_phone_alias_uses_resolved_user_id_and_separate_boundary(self):
+        client = AsyncMock()
+        client.get_input_entity.return_value = MagicMock(user_id=9001)
+        client.get_messages.side_effect = [[MagicMock(id=100)], [MagicMock(id=7)]]
+        self.assertEqual(await bot.login_message_boundaries(client), {777000: 100, 9001: 7})
+        client.get_input_entity.assert_awaited_once_with('+42777')
+
+    async def test_phone_alias_of_primary_is_not_read_twice(self):
+        client = AsyncMock()
+        client.get_input_entity.return_value = MagicMock(user_id=777000)
+        client.get_messages.return_value = [MagicMock(id=100)]
+        self.assertEqual(await bot.login_message_boundaries(client), {777000: 100})
+        client.get_messages.assert_awaited_once()
+
+    async def test_missing_phone_alias_keeps_primary(self):
+        client = AsyncMock()
+        client.get_input_entity.side_effect = ValueError('unknown phone')
+        client.get_messages.return_value = []
+        self.assertEqual(await bot.login_message_boundaries(client), {777000: 0})
+
+    async def test_secondary_code_is_found_while_primary_hangs(self):
+        import asyncio
+        stopped = asyncio.Event()
+        async def messages(peer, **kwargs):
+            if peer == 777000:
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    stopped.set()
+            else:
+                self.assertEqual(kwargs['min_id'], 7)
+                yield MagicMock(id=7, out=False, raw_text='Code: 11111')
+                yield MagicMock(id=8, out=False, raw_text='Code: 22222')
+        code = await bot.poll_login_code(MagicMock(iter_messages=messages), self.migration(),
+                                         0, after_id={777000: 100, 9001: 7}, timeout=.5)
+        self.assertEqual(code, '22222')
+        self.assertTrue(stopped.is_set())
+
     async def test_server_id_boundary_ignores_wrong_host_clock_and_outgoing_codes(self):
         async def messages(*args, **kwargs):
             self.assertEqual(kwargs['min_id'], 100)
