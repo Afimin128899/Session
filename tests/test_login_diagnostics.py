@@ -51,6 +51,7 @@ class AlternateDeliveryTests(unittest.IsolatedAsyncioTestCase):
             old.is_connected = MagicMock(return_value=True)
             new.is_connected = MagicMock(return_value=True)
             old.get_me.return_value = MagicMock(phone='10000000000')
+            old.get_messages.return_value = []
             new.send_code_request.return_value = SentCode(SentCodeTypeSms(5), 'offline-hash')
             client, state = AsyncMock(), AsyncMock()
             with patch.object(bot, 'db', database), \
@@ -69,3 +70,4 @@ class AlternateDeliveryTests(unittest.IsolatedAsyncioTestCase):
                     mig = bot.current_migration.get(-960)
                     if mig:
                         await bot.cleanup_migration(mig, state)
+

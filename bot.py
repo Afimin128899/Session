@@ -810,18 +810,41 @@ async def claim_interactive_migration(mig: ActiveMigration):
     mig.last_activity = time.time()
 
 
+class LoginCodeTimeout(TimeoutError):
+    """Safe explanation: never include message contents or login credentials."""
+
+
+async def login_message_boundary(client):
+    async with asyncio.timeout(10):
+        messages = await client.get_messages(777000, limit=1)
+    return messages[0].id if messages else 0
+
+
 async def poll_login_code(client, mig, request_ts, *, timeout=90.0, read_timeout=10.0,
-                          interval=1.5):
+                          interval=1.5, after_id=None):
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     failures = 0
+    reads = 0
+    fresh_ids = set()
+    unrecognized_ids = set()
+
+    def stopped(reason, detail):
+        logger.warning("code_wait task=%s outcome=%s reads=%s fresh=%s unrecognized=%s",
+                       mig.id, reason, reads, len(fresh_ids), len(unrecognized_ids))
+        return LoginCodeTimeout(detail)
 
     async def read_code():
-        async for msg in client.iter_messages(777000, limit=3):
-            if msg.date and msg.date.timestamp() >= request_ts:
+        options = {"min_id": after_id} if after_id is not None else {}
+        async for msg in client.iter_messages(777000, limit=20, **options):
+            fresh = (msg.id > after_id if after_id is not None else
+                     msg.date and msg.date.timestamp() >= request_ts)
+            if fresh and getattr(msg, 'out', False) is not True:
+                fresh_ids.add(msg.id)
                 code = extract_telegram_code(msg.raw_text or "")
                 if code:
                     return code
+                unrecognized_ids.add(msg.id)
         return None
 
     while loop.time() < deadline:
@@ -829,24 +852,30 @@ async def poll_login_code(client, mig, request_ts, *, timeout=90.0, read_timeout
             raise asyncio.CancelledError
         try:
             code = await asyncio.wait_for(read_code(), min(read_timeout, deadline - loop.time()))
+            reads += 1
             failures = 0
             if code:
+                logger.info("code_wait task=%s outcome=found reads=%s", mig.id, reads)
                 return code
         except (AuthKeyUnregisteredError, UserDeactivatedError, PhoneNumberBannedError):
             raise
         except FloodWaitError as exc:
             delay = exc.seconds + 1
             if delay >= deadline - loop.time():
-                raise TimeoutError("FloodWait превышает время ожидания кода") from exc
+                raise stopped('flood_wait', f"Telegram ограничил чтение 777000: подождите {exc.seconds} с.") from exc
             await asyncio.sleep(delay)
             continue
         except (TimeoutError, ConnectionError, OSError) as exc:
             failures += 1
             logger.warning("Ошибка чтения 777000 (%s/3): %s", failures, type(exc).__name__)
             if failures >= 3:
-                raise TimeoutError("Не удалось прочитать 777000 после трёх попыток") from exc
+                raise stopped('read_failed', "Не удалось прочитать 777000 после трёх попыток подключения.") from exc
         await asyncio.sleep(min(interval, max(0, deadline - loop.time())))
-    raise TimeoutError("Код от 777000 не получен за отведённое время")
+    if not reads:
+        raise stopped('read_failed', "Чтение 777000 не завершилось за отведённое время.")
+    if fresh_ids:
+        raise stopped('unrecognized', "В 777000 появились новые сообщения, но код входа не распознан.")
+    raise stopped('no_new_messages', "Чат 777000 доступен, но новых входящих сообщений после запроса нет.")
 
 
 async def cleanup_migration(mig: ActiveMigration, state: Optional[FSMContext] = None):
@@ -1548,6 +1577,22 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
         mig.new_client = new_client
         await new_client.connect()
 
+        # Record the last server message before requesting a new login code.
+        # Comparing message IDs avoids dependence on the host clock.
+        after_id = None
+        if auto_mode:
+            try:
+                after_id = await login_message_boundary(old_client)
+            except FloodWaitError as exc:
+                await reporter.update(
+                    f"⏳ Telegram ограничил чтение исходной сессии: подождите {exc.seconds} с. "
+                    "Код не запрошен; исходный файл сохранён.", force=True)
+                return
+            except (TimeoutError, ConnectionError, OSError):
+                await reporter.update(
+                    "❌ Исходная сессия не смогла прочитать 777000. Код не запрошен. "
+                    "Проверьте подключение и прокси. Исходный файл сохранён.", force=True)
+                return
         request_ts = int(time.time()) - 5
         async with asyncio.timeout(30):
             result = await new_client.send_code_request(phone)
@@ -1580,11 +1625,12 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
                 reply_markup=action_kb(can_skip=True),
             )
             try:
-                code = await poll_login_code(old_client, mig, request_ts)
-            except TimeoutError:
+                code = await poll_login_code(old_client, mig, request_ts, after_id=after_id)
+            except TimeoutError as exc:
+                detail = str(exc) if isinstance(exc, LoginCodeTimeout) else "Истекло время чтения 777000."
                 await reporter.update(
-                    f"❌ Не удалось дождаться кода от 777000 для <code>{phone}</code>.\n"
-                    "Истёк таймаут или недоступно чтение сообщений. Попробуйте /manual.",
+                    f"❌ {html.escape(detail)}\nИсходная сессия сохранена. "
+                    f"Задача: <code>{mig.id}</code>.",
                     force=True,
                 )
                 await cleanup_migration(mig)
@@ -2583,5 +2629,6 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Бот остановлен.")
+
 
 
