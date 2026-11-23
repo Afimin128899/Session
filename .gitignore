@@ -1,0 +1,11 @@
+.env
+*.session*
+*.zip
+*.sqlite*
+*.db
+sessions/
+data/
+__pycache__/
+.pytest_cache/
+.venv/
+new_sessions/
