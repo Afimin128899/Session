@@ -770,10 +770,10 @@ class LoginCodeTimeoutTests(unittest.IsolatedAsyncioTestCase):
                                          MagicMock(skip_requested=False), 2, timeout=1)
         self.assertEqual(code, '22222')
 
-    async def test_unexpected_read_error_is_not_swallowed(self):
+    async def test_unavailable_peer_has_distinct_diagnostic(self):
         client = MagicMock()
         client.iter_messages.side_effect = ValueError('bad peer')
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(bot.LoginCodeTimeout, 'Служебный чат недоступен'):
             await bot.poll_login_code(client, MagicMock(skip_requested=False), 0)
 
 

@@ -49,7 +49,8 @@ from pydantic import Field, field_validator, AliasChoices
 from pydantic_settings import BaseSettings, SettingsConfigDict, NoDecode
 from spam_check import LABELS as SPAM_LABELS, SpamResult, check_spam_status
 from session_devices import LABELS as DEVICE_LABELS, reset_other_sessions
-from login_diagnostics import runtime_version, delivery_description
+from login_diagnostics import runtime_version, delivery_description, value_error_reason, safe_error_frames
+from proxy_config import ProxyConfigError, normalize_proxy
 from telethon.tl.types.auth import SentCode, SentCodeTypeApp, SentCodeSuccess
 from telethon.tl.functions.auth import SendCodeRequest
 from telethon.tl.types import CodeSettings
@@ -195,7 +196,7 @@ class SafeLogFilter(logging.Filter):
     def filter(self, record):
         message = record.getMessage()
         if record.exc_info:
-            message += " [" + record.exc_info[0].__name__ + "]"
+            message += " [" + record.exc_info[0].__name__ + "] frames=" + safe_error_frames(record.exc_info[2])
             record.exc_info = None
             record.exc_text = None
         message = re.sub(r"(?<!\w)\+?\d{7,15}(?!\w)", "<номер скрыт>", message)
@@ -217,6 +218,10 @@ def public_error(exc: BaseException) -> str:
     """Return a safe, non-sensitive error label for Telegram messages."""
     if isinstance(exc, FloodWaitError):
         return f"Telegram требует подождать {exc.seconds} с; повторите после окончания срока."
+    if isinstance(exc, ProxyConfigError):
+        return html.escape(str(exc))
+    if isinstance(exc, ValueError):
+        return html.escape(value_error_reason(exc)[1])
     name = type(exc).__name__
     return html.escape(name.removesuffix("Error") or "ошибка")
 
@@ -511,6 +516,7 @@ class ActiveMigration:
     old_session_error: Optional[str] = None
     operation_mode: int = 1
     source_user_id: Optional[int] = None
+    stage: str = "queued"
 
 
 chat_semaphores: Dict[int, asyncio.Semaphore] = {}
@@ -720,17 +726,7 @@ def extract_telegram_code(text: str) -> Optional[str]:
 
 
 def parse_session_proxy(json_data: dict) -> Optional[dict]:
-    p = json_data.get("proxy")
-    if isinstance(p, dict):
-        proto = p.get("type") or p.get("protocol") or "socks5"
-        return {
-            "proxy_type": proto.lower(),
-            "addr": p.get("host") or p.get("addr") or p.get("ip"),
-            "port": int(p.get("port", 1080)),
-            "username": p.get("user") or p.get("username"),
-            "password": p.get("pass") or p.get("password"),
-        }
-    return None
+    return normalize_proxy(json_data.get("proxy"))
 
 
 class ManagedClient(TelegramClient):
@@ -741,7 +737,7 @@ class ManagedClient(TelegramClient):
 
 
 def get_configured_client(session_target: Any, fp: dict[str, str], proxy: Optional[dict] = None) -> TelegramClient:
-    active_proxy = proxy or settings.fallback_proxy
+    active_proxy = normalize_proxy(proxy if proxy is not None else settings.fallback_proxy)
     return ManagedClient(
         session_target,
         settings.api_id,
@@ -878,19 +874,58 @@ async def login_message_boundary(client):
 
 
 async def login_message_boundaries(client):
-    boundaries = {777000: await login_message_boundary(client)}
-    async with asyncio.timeout(10):
+    boundaries = {}
+    dialogs = None
+
+    async def from_dialogs(primary):
+        nonlocal dialogs
+        if dialogs is None:
+            dialogs = await client.get_dialogs(limit=None)
+        for dialog in dialogs:
+            entity = dialog.entity
+            if not isinstance(entity, User):
+                continue
+            if (primary and entity.id == 777000) or (
+                not primary and str(getattr(entity, 'phone', '') or '').lstrip('+') == '42777'
+            ):
+                return entity
+        return None
+
+    try:
         try:
-            # A displayed phone number is not necessarily the Telegram user ID.
-            peer = await client.get_input_entity('+42777')
+            boundaries[777000] = await login_message_boundary(client)
         except ValueError:
-            logger.info('code_source alias=42777 outcome=unavailable')
-            return boundaries
-        peer_id = getattr(peer, 'user_id', None)
-        if not isinstance(peer_id, int) or peer_id in boundaries:
-            return boundaries
-        messages = await client.get_messages(peer, limit=1)
-        boundaries[peer_id] = messages[0].id if messages else 0
+            async with asyncio.timeout(10):
+                entity = await from_dialogs(True)
+                if entity:
+                    messages = await client.get_messages(entity, limit=1)
+                    boundaries[entity.id] = messages[0].id if messages else 0
+    except FloodWaitError:
+        raise
+    except (ValueError, TimeoutError, ConnectionError, OSError) as exc:
+        logger.info('code_source alias=777000 outcome=unavailable error=%s', type(exc).__name__)
+    if 777000 not in boundaries:
+        logger.info('code_source alias=777000 outcome=unavailable')
+
+    try:
+        async with asyncio.timeout(10):
+            try:
+                peer = await client.get_input_entity('+42777')
+            except ValueError:
+                entity = await from_dialogs(False)
+                if entity is None:
+                    logger.info('code_source alias=42777 outcome=unavailable')
+                    return boundaries
+                peer = await client.get_input_entity(entity)
+            peer_id = getattr(peer, 'user_id', None)
+            if not isinstance(peer_id, int) or peer_id in boundaries:
+                return boundaries
+            messages = await client.get_messages(peer, limit=1)
+            boundaries[peer_id] = messages[0].id if messages else 0
+    except FloodWaitError:
+        raise
+    except (ValueError, TimeoutError, ConnectionError, OSError) as exc:
+        logger.info('code_source alias=42777 outcome=unavailable error=%s', type(exc).__name__)
     return boundaries
 
 
@@ -967,6 +1002,8 @@ async def poll_login_code(client, mig, request_ts, *, timeout=90.0, read_timeout
                 raise stopped('flood_wait', f"Telegram ограничил чтение служебных чатов: подождите {exc.seconds} с.") from exc
             await asyncio.sleep(delay)
             continue
+        except ValueError:
+            raise stopped('chat_unavailable', "Служебный чат недоступен; введите код вручную или отмените задачу.") from None
         except (TimeoutError, ConnectionError, OSError) as exc:
             failures += 1
             logger.warning("Ошибка чтения служебных чатов (%s/3): %s", failures, type(exc).__name__)
@@ -990,8 +1027,7 @@ async def cleanup_migration(mig: ActiveMigration, state: Optional[FSMContext] = 
     for client in (mig.old_client, mig.new_client):
         if client:
             try:
-                if client.is_connected():
-                    await client.disconnect()
+                await client.disconnect()
             except Exception:
                 pass
 
@@ -1518,8 +1554,7 @@ async def process_fast_clean_session(item: dict, bot: Bot, state: Optional[FSMCo
         )
     finally:
         try:
-            if client.is_connected():
-                await client.disconnect()
+            await client.disconnect()
         except Exception:
             pass
         if temp_dir.exists() and (archive_saved or not list(temp_dir.glob("*.zip"))):
@@ -1569,6 +1604,7 @@ async def finalize_combined(mig: ActiveMigration, message: Message, state: Optio
     root = Path(os.getenv("DATA_DIR") or Path(settings.db_file).resolve().parent).resolve()
     reporter = StatusReporter(mig.status_message or message)
     try:
+        mig.stage = "new_verify"
         if not client or not work:
             raise RuntimeError("Нет новой авторизации или рабочей сессии")
         if not await client.is_user_authorized():
@@ -1588,6 +1624,7 @@ async def finalize_combined(mig: ActiveMigration, message: Message, state: Optio
         metadata = await create_metadata(client, mig.phone, mig.fingerprint)
         await client.disconnect()
         session_file = work / 'new_session.session'
+        mig.stage = "save_before_cleanup"
         durable = persist_new_session(root, mig.chat_id, mig.id, 'before_cleanup', session_file, metadata)
         filename = f'{mig.id}_new.session.zip'
         archive_id = db.save_archive(mig.chat_id, filename, durable.archive.read_bytes())
@@ -1595,6 +1632,7 @@ async def finalize_combined(mig: ActiveMigration, message: Message, state: Optio
         # Use only the new authorization for account mutations.
         await client.connect()
         await reporter.update("Новая сессия сохранена. Очищаю аккаунт через новую авторизацию...", force=True)
+        mig.stage = "clean_new"
         report = await deep_clean_account(client, reporter)
         if not await client.is_user_authorized():
             raise RuntimeError("Новая авторизация недоступна после очистки")
@@ -1602,6 +1640,7 @@ async def finalize_combined(mig: ActiveMigration, message: Message, state: Optio
         if metadata['id'] != expected_id:
             raise RuntimeError("Аккаунт новой авторизации изменился")
         await client.disconnect()
+        mig.stage = "save_after_cleanup"
         durable = persist_new_session(root, mig.chat_id, mig.id, 'after_cleanup', session_file, metadata)
         db.replace_archive(archive_id, mig.chat_id, filename, durable.archive.read_bytes())
 
@@ -1614,6 +1653,7 @@ async def finalize_combined(mig: ActiveMigration, message: Message, state: Optio
             stats['failed'] += 1
         else:
             await reporter.update("Результат сохранён. Завершаю только загруженную старую авторизацию...", force=True)
+            mig.stage = "source_logout"
             success, reason = await terminate_old_session(source_client)
             mig.old_session_terminated = success
             mig.old_session_error = reason
@@ -1634,7 +1674,7 @@ async def finalize_combined(mig: ActiveMigration, message: Message, state: Optio
     except Exception as exc:
         stats['failed'] += 1
         queue_paused[mig.chat_id] = True
-        logger.error("Комбинированная операция task=%s остановлена: %s", mig.id, type(exc).__name__)
+        logger.error("Комбинированная операция task=%s stage=%s остановлена: %s", mig.id, mig.stage, type(exc).__name__, exc_info=True)
         summary = "Операция остановлена (" + type(exc).__name__ + "). Старая авторизация не отзывалась."
     finally:
         # On storage failure, preserve even the work session: it may be the only
@@ -1743,10 +1783,7 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
         reply_markup=action_kb(can_skip=True),
     )
 
-    proxy_dict = json.loads(item["proxy_json"]) if item["proxy_json"] else None
-    if proxy_dict:
-        if not await verify_proxy_alive(proxy_dict):
-            proxy_dict = None
+    proxy_dict = None
 
     mig = ActiveMigration(
         id=mig_id,
@@ -1761,6 +1798,11 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
     reporter = StatusReporter(status)
 
     try:
+        mig.stage = 'proxy_config'
+        proxy_dict = normalize_proxy(json.loads(item['proxy_json'])) if item.get('proxy_json') else None
+        mig.proxy_config = proxy_dict
+        if proxy_dict and not await verify_proxy_alive(proxy_dict):
+            raise ProxyConfigError('Прокси недоступен; подключение без него не выполнялось.')
         if not auto_mode:
             await claim_interactive_migration(mig)
         mig.temp_dir = Path(tempfile.mkdtemp(prefix=f"mig_{chat_id}_{mig_id}_"))
@@ -1768,15 +1810,19 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
         new_session_path = str(mig.temp_dir / "new_session")
         shutil.copy(item["file_path"], old_session_path)
 
+        mig.stage = "source_client_create"
         old_client = get_configured_client(str(old_session_path.with_suffix("")), mig.fingerprint, mig.proxy_config)
         mig.old_client = old_client
+        mig.stage = "source_connect"
         await old_client.connect()
 
+        mig.stage = "source_authorization"
         if not await old_client.is_user_authorized():
             await reporter.update(f"❌ <b>{html.escape(item['original_name'])}</b>: сессия не авторизована.", force=True)
             await cleanup_migration(mig)
             return
 
+        mig.stage = "source_identity"
         me = await old_client.get_me()
         mig.source_user_id = me.id
         phone = me.phone
@@ -1797,8 +1843,10 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
             reply_markup=action_kb(can_skip=True),
         )
 
+        mig.stage = "new_client_create"
         new_client = get_configured_client(new_session_path, mig.fingerprint, mig.proxy_config)
         mig.new_client = new_client
+        mig.stage = "new_connect"
         await new_client.connect()
 
         # Record the last server message before requesting a new login code.
@@ -1806,18 +1854,24 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
         after_id = None
         if auto_mode:
             try:
+                mig.stage = "code_sources"
                 after_id = await login_message_boundaries(old_client)
+                if not after_id:
+                    auto_mode = False
+                    await claim_interactive_migration(mig)
+                    await reporter.update("Служебные чаты недоступны. Авточтение отключено; код можно ввести вручную.", force=True)
             except FloodWaitError as exc:
                 await reporter.update(
                     f"⏳ Telegram ограничил чтение исходной сессии: подождите {exc.seconds} с. "
                     "Код не запрошен; исходный файл сохранён.", force=True)
                 return
-            except (TimeoutError, ConnectionError, OSError):
+            except (TimeoutError, ConnectionError, OSError, ValueError):
                 await reporter.update(
                     "❌ Исходная сессия не смогла прочитать 777000. Код не запрошен. "
                     "Проверьте подключение и прокси. Исходный файл сохранён.", force=True)
                 return
         request_ts = int(time.time()) - 5
+        mig.stage = "code_request"
         async with asyncio.timeout(30):
             result = await new_client.send_code_request(phone)
         if isinstance(result, SentCodeSuccess):
@@ -1842,7 +1896,7 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
                 f"📩 Способ подтверждения, выбранный Telegram: <b>{delivery}</b>.\n"
                 "Код в 777000 не ожидается. Если вы получили код, введите его вручную. "
                 "Если его нет — отмените задачу.\n"
-                f"Задача: <code>{mig.id}</code>. Версия: new-clean-logout-3.",
+                f"Задача: <code>{mig.id}</code>. Версия: value-diagnostics-4.",
                 reply_markup=action_kb(can_skip=True),
             )
             return
@@ -1851,11 +1905,12 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
             await reporter.update(
                 f"📩 Telegram указал доставку: <b>{delivery}</b>.\n"
                 "Проверяю 777000 и доступный чат +42777; доставка пока не подтверждена.\n"
-                f"Задача: <code>{mig.id}</code>. Версия: new-clean-logout-3.",
+                f"Задача: <code>{mig.id}</code>. Версия: value-diagnostics-4.",
                 force=True,
                 reply_markup=action_kb(can_skip=True),
             )
             try:
+                mig.stage = "code_poll"
                 code = await poll_login_code(old_client, mig, request_ts, after_id=after_id)
             except TimeoutError as exc:
                 detail = str(exc) if isinstance(exc, LoginCodeTimeout) else "Истекло время чтения 777000."
@@ -1875,7 +1930,7 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
             mig.waiting_manual_code = True
             await state.set_state(MigrateStates.waiting_manual_code)
             await status.edit_text(
-                f"📩 Код отправлен на <code>{mask_phone(phone)}</code>\n\nОтправьте код подтверждения в чат:",
+                f"Telegram указал способ подтверждения: {delivery}. Введите код, если получили его. Доставка не гарантируется:",
                 reply_markup=action_kb(can_skip=True),
             )
             return
@@ -1887,6 +1942,7 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
         )
 
         try:
+            mig.stage = "new_sign_in"
             await new_client.sign_in(phone=phone, code=code, phone_code_hash=mig.phone_code_hash)
 
 
@@ -1896,6 +1952,7 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
             if mig.auto_2fa_password:
                 await reporter.update("🔒 Пароль 2FA найден в JSON! Ввожу автоматически...", force=True)
                 try:
+                    mig.stage = "new_2fa"
                     await new_client.sign_in(password=mig.auto_2fa_password)
 
 
@@ -1937,8 +1994,9 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
         await reporter.update(f"❌ Аккаунт <code>{mask_phone(mig.phone)}</code> деактивирован.", force=True)
         await cleanup_migration(mig)
     except Exception as e:
-        logger.exception("Ошибка process_one_session")
-        await reporter.update(f"❌ Сбой обработки: <code>{public_error(e)}</code>", force=True)
+        reason = value_error_reason(e)[0] if isinstance(e, ValueError) else type(e).__name__
+        logger.error("Ошибка process_one_session task=%s stage=%s reason=%s", mig.id, mig.stage, reason, exc_info=True)
+        await reporter.update(f"❌ Сбой обработки: <code>{public_error(e)}</code>\nЗадача: {mig.id} · этап: {mig.stage}", force=True)
         await cleanup_migration(mig)
     finally:
         if mig.id in active_migrations and not (mig.waiting_2fa or mig.waiting_manual_code):
@@ -2765,7 +2823,7 @@ async def process_document_upload(message: Message, state: FSMContext):
                         auto_pass = j_data.get("twoFA") or j_data.get("password") or j_data.get("2fa")
                         proxy_dict = parse_session_proxy(j_data)
                     except Exception:
-                        pass
+                        raise ValueError("Некорректный JSON или параметры proxy; проверьте формат и порт.") from None
 
                 queued_items.append((
                     str(uuid.uuid4()), str(s_path), s_path.name,
